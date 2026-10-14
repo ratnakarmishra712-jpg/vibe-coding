@@ -76,6 +76,9 @@ decided it** — so you can watch the firewall think.
 
 ## What's here (and what each file teaches)
 
+For the full design — every stage, the code, flow diagrams, and honest
+limitations — see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+
 | File | Concept |
 |------|---------|
 | `ngfw/packet.py` | A portable packet model — the common language every backend speaks. |
