@@ -2,6 +2,8 @@
 
 Both classes take two callbacks: `send(data, addr)` to transmit a UDP datagram and
 `tun_write(packet)` to deliver a decrypted IP packet to the local TUN device.
+Addresses are socket address tuples as returned by `recvfrom`: `(host, port)` for
+IPv4 or `(host, port, flowinfo, scope_id)` for IPv6.
 """
 
 import ipaddress
@@ -15,9 +17,22 @@ from .protocol import ProtocolError
 
 log = logging.getLogger(__name__)
 
-Addr = tuple[str, int]
+Addr = tuple  # (host, port) or (host, port, flowinfo, scope_id)
+IPInterface = ipaddress.IPv4Interface | ipaddress.IPv6Interface
 SendFn = Callable[[bytes, Addr], None]
 TunWriteFn = Callable[[bytes], None]
+
+def format_addr(addr: Addr) -> str:
+    host, port = addr[0], addr[1]
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _reserved(iface: IPInterface) -> set:
+    net = iface.network
+    if net.version == 4 and net.prefixlen < 31:
+        return {iface.ip, net.network_address, net.broadcast_address}
+    return {iface.ip, net.network_address}  # IPv6 subnet-router anycast address
+
 
 KEEPALIVE_INTERVAL = 25.0
 SESSION_TIMEOUT = 180.0
@@ -28,35 +43,43 @@ REKEY_INTERVAL = 600.0
 @dataclass
 class _ServerPeer:
     public_key: bytes
-    tunnel_ip: ipaddress.IPv4Address
+    addresses: frozenset[protocol.IPAddress]
     session: protocol.Session | None = None
     addr: Addr | None = None
     # Highest handshake timestamp accepted, kept after a session expires so a
     # captured INIT can never be replayed to hijack the peer.
     last_init_ts: int = -1
 
+    @property
+    def name(self) -> str:
+        return ",".join(sorted(map(str, self.addresses), key=lambda a: (":" in a, a)))
+
 
 class Server:
-    def __init__(self, static: crypto.KeyPair, interface: ipaddress.IPv4Interface,
-                 peers: dict[bytes, ipaddress.IPv4Address], send: SendFn, tun_write: TunWriteFn,
+    def __init__(self, static: crypto.KeyPair, interfaces: list[IPInterface],
+                 peers: dict[bytes, list[protocol.IPAddress]], send: SendFn, tun_write: TunWriteFn,
                  load_threshold: int = dos.DEFAULT_LOAD_THRESHOLD, clock: dos.Clock = time.monotonic) -> None:
         self.static = static
         self.clock = clock
         self.cookies = dos.CookieChecker(static.public)
         self.load = dos.LoadMonitor(load_threshold)
         self.limiter = dos.RateLimiter()
-        self.interface = interface
+        self.interfaces = interfaces
         self.send = send
         self.tun_write = tun_write
-        reserved = {interface.ip, interface.network.network_address, interface.network.broadcast_address}
         self.peers: dict[bytes, _ServerPeer] = {}
-        self.by_ip: dict[ipaddress.IPv4Address, _ServerPeer] = {}
-        for key, ip in peers.items():
-            if ip not in interface.network or ip in reserved:
-                raise ValueError(f"peer address {ip} is not usable in {interface.network}")
-            if ip in self.by_ip:
-                raise ValueError(f"peer address {ip} assigned twice")
-            self.peers[key] = self.by_ip[ip] = _ServerPeer(key, ip)
+        self.by_ip: dict[protocol.IPAddress, _ServerPeer] = {}
+        for key, addresses in peers.items():
+            if not addresses:
+                raise ValueError(f"peer {crypto.encode_key(key)} has no addresses")
+            peer = self.peers[key] = _ServerPeer(key, frozenset(addresses))
+            for ip in addresses:
+                if not any(ip.version == i.version and ip in i.network and ip not in _reserved(i)
+                           for i in interfaces):
+                    raise ValueError(f"peer address {ip} is not usable in any tunnel subnet")
+                if ip in self.by_ip:
+                    raise ValueError(f"peer address {ip} assigned twice")
+                self.by_ip[ip] = peer
         self.by_index: dict[int, _ServerPeer] = {}
 
     def handle_datagram(self, data: bytes, addr: Addr) -> None:
@@ -93,7 +116,7 @@ class Server:
         peer.session, peer.addr, peer.last_init_ts = session, addr, init.timestamp_ns
         self.by_index[session.local_idx] = peer
         self.send(packet, addr)
-        log.info("peer %s (%s) connected from %s:%d", peer.tunnel_ip, crypto.encode_key(peer.public_key), *addr)
+        log.info("peer %s (%s) connected from %s", peer.name, crypto.encode_key(peer.public_key), format_addr(addr))
 
     def _handle_data(self, data: bytes, addr: Addr) -> None:
         peer = self.by_index.get(protocol.data_receiver_index(data))
@@ -103,12 +126,12 @@ class Server:
         peer.addr = addr  # authenticated packet: follow the peer if it roams
         if not payload:
             return  # keepalive
-        if protocol.ipv4_source(payload) != peer.tunnel_ip:
-            raise ProtocolError(f"spoofed source from peer {peer.tunnel_ip}")
+        if protocol.ip_source(payload) not in peer.addresses:
+            raise ProtocolError(f"spoofed source from peer {peer.name}")
         self.tun_write(payload)
 
     def handle_tun(self, packet: bytes) -> None:
-        dst = protocol.ipv4_destination(packet)
+        dst = protocol.ip_destination(packet)
         peer = self.by_ip.get(dst) if dst else None
         if peer is None or peer.session is None:
             return
@@ -119,7 +142,7 @@ class Server:
         self.limiter.prune(now)
         for peer in self.peers.values():
             if peer.session is not None and now - peer.session.last_received > SESSION_TIMEOUT:
-                log.info("peer %s timed out", peer.tunnel_ip)
+                log.info("peer %s timed out", peer.name)
                 self._end_session(peer)
 
     def _end_session(self, peer: _ServerPeer) -> None:
@@ -154,7 +177,7 @@ class Client:
         self.send(self.pending.packet, self.server)
 
     def handle_datagram(self, data: bytes, addr: Addr) -> None:
-        if addr != self.server:
+        if addr[:2] != self.server[:2]:
             return
         try:
             kind = protocol.message_type(data)
@@ -176,7 +199,7 @@ class Client:
         self.pending = None
         self.previous, self.session = self.session, session
         self.session_started = time.monotonic()
-        log.info("handshake complete with %s:%d", *self.server)
+        log.info("handshake complete with %s", format_addr(self.server))
         # Confirm the session right away so the server sees traffic on it.
         self.send(session.seal(b""), self.server)
 
@@ -199,6 +222,11 @@ class Client:
         raise ProtocolError("unknown session")
 
     def handle_tun(self, packet: bytes) -> None:
+        dst = protocol.ip_destination(packet)
+        # The kernel emits IPv6 neighbour/router discovery and MLD on the TUN device;
+        # there is no link layer to resolve, so don't waste tunnel traffic on them.
+        if dst is None or dst.is_multicast:
+            return
         if self.session is not None:
             self.send(self.session.seal(packet), self.server)
 

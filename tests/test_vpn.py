@@ -1,5 +1,6 @@
 import ipaddress
 import os
+import socket
 import struct
 import tempfile
 import time
@@ -7,22 +8,30 @@ import unittest
 from unittest import mock
 
 from vpn import crypto, dos, protocol
-from vpn.__main__ import load_peers
+from vpn.__main__ import load_peers, parse_hostport, parse_interfaces, server_socket
 from vpn.node import SESSION_TIMEOUT, Client, Server
 
 SERVER_KEY = crypto.KeyPair.generate()
 ALICE = crypto.KeyPair.generate()
 BOB = crypto.KeyPair.generate()
 MALLORY = crypto.KeyPair.generate()
-ALICE_IP = ipaddress.IPv4Address("10.8.0.2")
-BOB_IP = ipaddress.IPv4Address("10.8.0.3")
+ALICE_IP = ipaddress.ip_address("10.8.0.2")
+ALICE_IP6 = ipaddress.ip_address("fd00:8::2")
+BOB_IP = ipaddress.ip_address("10.8.0.3")
 SERVER_ADDR = ("192.0.2.1", 51820)
-PEERS = {ALICE.public: ALICE_IP, BOB.public: BOB_IP}
+PEERS = {ALICE.public: [ALICE_IP, ALICE_IP6], BOB.public: [BOB_IP]}
+SERVER_IFACES = [ipaddress.ip_interface("10.8.0.1/24"), ipaddress.ip_interface("fd00:8::1/64")]
 
 
 def ipv4_packet(src: str, dst: str, payload: bytes = b"hello") -> bytes:
     header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), 0, 0, 64, 17, 0,
                          ipaddress.IPv4Address(src).packed, ipaddress.IPv4Address(dst).packed)
+    return header + payload
+
+
+def ipv6_packet(src: str, dst: str, payload: bytes = b"hello") -> bytes:
+    header = struct.pack("!IHBB16s16s", 6 << 28, len(payload), 17, 64,
+                         ipaddress.IPv6Address(src).packed, ipaddress.IPv6Address(dst).packed)
     return header + payload
 
 
@@ -33,7 +42,7 @@ class Network:
         self.wire: list[tuple[bytes, tuple, tuple]] = []  # (data, src, dst)
         self.server_tun: list[bytes] = []
         self.now = 1000.0
-        self.server = Server(SERVER_KEY, ipaddress.IPv4Interface("10.8.0.1/24"), PEERS,
+        self.server = Server(SERVER_KEY, SERVER_IFACES, PEERS,
                              lambda d, a: self.wire.append((d, SERVER_ADDR, a)), self.server_tun.append,
                              load_threshold=load_threshold, clock=lambda: self.now)
         self.clients: dict[tuple, Client] = {}
@@ -341,7 +350,112 @@ class DosTest(unittest.TestCase):
         self.assertEqual(rl._buckets, {})
 
 
+class IPv6Test(unittest.TestCase):
+    ALICE_ADDR = ("2001:db8::7", 40000, 0, 0)  # outer transport over IPv6 too
+
+    def connected(self):
+        net = Network()
+        alice = net.add_client(ALICE, self.ALICE_ADDR)
+        net.connect(alice)
+        self.assertTrue(alice.connected)
+        return net, alice
+
+    def test_ip_header_parsing(self):
+        v4, v6 = ipv4_packet("10.8.0.2", "10.8.0.1"), ipv6_packet("fd00:8::2", "fd00:8::1")
+        self.assertEqual(protocol.ip_source(v4), ipaddress.ip_address("10.8.0.2"))
+        self.assertEqual(protocol.ip_destination(v4), ipaddress.ip_address("10.8.0.1"))
+        self.assertEqual(protocol.ip_source(v6), ipaddress.ip_address("fd00:8::2"))
+        self.assertEqual(protocol.ip_destination(v6), ipaddress.ip_address("fd00:8::1"))
+        for junk in (b"", v6[:39], v4[:19], b"\x50" + v4[1:]):
+            self.assertIsNone(protocol.ip_source(junk))
+            self.assertIsNone(protocol.ip_destination(junk))
+
+    def test_ipv6_traffic_flows_both_ways(self):
+        net, alice = self.connected()
+        out = ipv6_packet("fd00:8::2", "fd00:8::1")
+        alice.handle_tun(out)
+        net.deliver()
+        self.assertEqual(net.server_tun, [out])
+        back = ipv6_packet("fd00:8::1", "fd00:8::2", b"world")
+        net.server.handle_tun(back)
+        net.deliver()
+        self.assertEqual(net.client_tun[self.ALICE_ADDR], [back])
+
+    def test_dual_stack_peer_uses_both_families(self):
+        net, alice = self.connected()
+        packets = [ipv4_packet("10.8.0.2", "10.8.0.1"), ipv6_packet("fd00:8::2", "fd00:8::1")]
+        for p in packets:
+            alice.handle_tun(p)
+        net.deliver()
+        self.assertEqual(net.server_tun, packets)
+
+    def test_ipv6_spoofing_dropped(self):
+        net = Network()
+        bob = net.add_client(BOB, ("198.51.100.8", 40000))
+        net.connect(bob)
+        bob.handle_tun(ipv6_packet("fd00:8::2", "fd00:8::1"))  # Alice's IPv6 address
+        bob.handle_tun(ipv6_packet("fd00:8::99", "fd00:8::1"))  # unassigned address
+        net.deliver()
+        self.assertEqual(net.server_tun, [])
+
+    def test_client_drops_multicast_and_non_ip(self):
+        net, alice = self.connected()
+        net.wire.clear()
+        alice.handle_tun(ipv6_packet("fe80::1", "ff02::2"))  # router solicitation
+        alice.handle_tun(b"\x00" * 40)
+        self.assertEqual(net.wire, [])
+
+    def test_cookie_for_ipv6_and_v4_mapped_sources(self):
+        net = Network(load_threshold=0)
+        for addr in (self.ALICE_ADDR, ("::ffff:198.51.100.7", 40000, 0, 0)):
+            cookie = net.server.cookies.cookie_for(addr, net.now)
+            init = protocol.create_init(ALICE, SERVER_KEY.public, cookie=cookie).packet
+            net.server.handle_datagram(init, addr)
+            self.assertEqual(net.wire.pop()[0][0], protocol.MSG_RESPONSE)
+            net.now += 1  # handshake timestamps must increase per peer
+
+    def test_server_rejects_bad_ipv6_peer_config(self):
+        for addrs in (["fd00:9::2"], ["fd00:8::1"], ["fd00:8::"], []):
+            with self.assertRaises(ValueError):
+                Server(SERVER_KEY, SERVER_IFACES, {ALICE.public: [ipaddress.ip_address(a) for a in addrs]},
+                       lambda d, a: None, lambda p: None)
+        with self.assertRaises(ValueError):  # IPv6 peer on an IPv4-only server
+            Server(SERVER_KEY, SERVER_IFACES[:1], {ALICE.public: [ALICE_IP6]}, lambda d, a: None, lambda p: None)
+
+    def test_dual_stack_socket_accepts_ipv4(self):
+        try:
+            sock = server_socket(None, 0)
+        except OSError as e:
+            self.skipTest(f"cannot bind: {e}")
+        with sock, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            if sock.family != socket.AF_INET6:
+                self.skipTest("IPv6 unavailable on this host")
+            sock.settimeout(2)
+            sender.sendto(b"x", ("127.0.0.1", sock.getsockname()[1]))
+            data, addr = sock.recvfrom(16)
+            self.assertEqual((data, addr[0]), (b"x", "::ffff:127.0.0.1"))
+
+
 class ConfigTest(unittest.TestCase):
+    def test_parse_hostport(self):
+        cases = {
+            "vpn.example.com": ("vpn.example.com", 51820),
+            "192.0.2.1:1234": ("192.0.2.1", 1234),
+            "[2001:db8::1]:1234": ("2001:db8::1", 1234),
+            "[2001:db8::1]": ("2001:db8::1", 51820),
+            "2001:db8::1": ("2001:db8::1", 51820),
+        }
+        for text, expected in cases.items():
+            self.assertEqual(parse_hostport(text), expected, text)
+        for bad in ("[2001:db8::1", "[::1]x"):
+            with self.assertRaises(ValueError):
+                parse_hostport(bad)
+
+    def test_parse_interfaces(self):
+        self.assertEqual(parse_interfaces(["10.8.0.1/24", "fd00:8::1/64"]), SERVER_IFACES)
+        with self.assertRaises(ValueError):
+            parse_interfaces(["10.8.0.1/24", "10.9.0.1/24"])
+
     def test_key_roundtrip(self):
         self.assertEqual(crypto.decode_key(crypto.encode_key(ALICE.public)), ALICE.public)
         with self.assertRaises(ValueError):
@@ -349,7 +463,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_load_peers(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
-            f.write(f"# comment\n{crypto.encode_key(ALICE.public)} 10.8.0.2\n\n")
+            f.write(f"# comment\n{crypto.encode_key(ALICE.public)} 10.8.0.2,fd00:8::2\n\n")
         try:
             peers = load_peers(f.name, [f"{crypto.encode_key(BOB.public)}=10.8.0.3"])
         finally:
@@ -357,12 +471,13 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(peers, PEERS)
 
     def test_server_rejects_bad_peer_config(self):
-        iface = ipaddress.IPv4Interface("10.8.0.1/24")
-        for peers in ({ALICE.public: ipaddress.IPv4Address("10.9.0.2")},
-                      {ALICE.public: ipaddress.IPv4Address("10.8.0.1")},
-                      {ALICE.public: ALICE_IP, BOB.public: ALICE_IP}):
+        ip = ipaddress.ip_address
+        for peers in ({ALICE.public: [ip("10.9.0.2")]},
+                      {ALICE.public: [ip("10.8.0.1")]},
+                      {ALICE.public: [ip("10.8.0.255")]},
+                      {ALICE.public: [ALICE_IP], BOB.public: [ALICE_IP]}):
             with self.assertRaises(ValueError):
-                Server(SERVER_KEY, iface, peers, lambda d, a: None, lambda p: None)
+                Server(SERVER_KEY, SERVER_IFACES, peers, lambda d, a: None, lambda p: None)
 
 
 if __name__ == "__main__":

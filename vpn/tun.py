@@ -1,6 +1,7 @@
 """Linux TUN device helpers."""
 
 import fcntl
+import ipaddress
 import os
 import struct
 import subprocess
@@ -8,6 +9,15 @@ import subprocess
 TUNSETIFF = 0x400454CA
 IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000
+
+
+def _ip(*args: str) -> None:
+    result = subprocess.run(["ip", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        hint = ""
+        if any(":" in a for a in args):  # an IPv6 address
+            hint = " (is IPv6 enabled on this host?)"
+        raise RuntimeError(f"`ip {' '.join(args)}` failed: {result.stderr.strip()}{hint}")
 
 
 class Tun:
@@ -18,10 +28,16 @@ class Tun:
         self.name = result[:16].rstrip(b"\x00").decode()
         os.set_blocking(self.fd, False)
 
-    def configure(self, address: str, mtu: int) -> None:
-        """Assign an address (CIDR) and bring the interface up. Requires CAP_NET_ADMIN."""
-        subprocess.run(["ip", "addr", "add", address, "dev", self.name], check=True)
-        subprocess.run(["ip", "link", "set", "dev", self.name, "mtu", str(mtu), "up"], check=True)
+    def configure(self, addresses: list[ipaddress.IPv4Interface | ipaddress.IPv6Interface], mtu: int) -> None:
+        """Assign addresses and bring the interface up. Requires CAP_NET_ADMIN."""
+        # Set the MTU first: the kernel refuses IPv6 addresses on links with MTU < 1280.
+        _ip("link", "set", "dev", self.name, "mtu", str(mtu))
+        for address in addresses:
+            # Skip duplicate address detection: nothing else is on a point-to-point TUN link,
+            # and DAD would leave the address unusable ("tentative") for a second or so.
+            extra = ["nodad"] if address.version == 6 else []
+            _ip("addr", "add", str(address), "dev", self.name, *extra)
+        _ip("link", "set", "dev", self.name, "up")
 
     def fileno(self) -> int:
         return self.fd

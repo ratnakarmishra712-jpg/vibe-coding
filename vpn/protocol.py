@@ -333,13 +333,30 @@ def open_cookie(responder_public: bytes, pending: PendingInit, packet: bytes) ->
         raise ProtocolError("cookie reply authentication failed") from None
 
 
-def ipv4_source(packet: bytes) -> ipaddress.IPv4Address | None:
-    if len(packet) < 20 or packet[0] >> 4 != 4:
-        return None
-    return ipaddress.IPv4Address(packet[12:16])
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+# version -> (minimum header length, source offset, destination offset, address length, address class)
+_IP_LAYOUT = {
+    4: (20, 12, 16, 4, ipaddress.IPv4Address),
+    6: (40, 8, 24, 16, ipaddress.IPv6Address),
+}
 
 
-def ipv4_destination(packet: bytes) -> ipaddress.IPv4Address | None:
-    if len(packet) < 20 or packet[0] >> 4 != 4:
+def _ip_field(packet: bytes, which: int) -> IPAddress | None:
+    if not packet:
         return None
-    return ipaddress.IPv4Address(packet[16:20])
+    layout = _IP_LAYOUT.get(packet[0] >> 4)
+    if layout is None or len(packet) < layout[0]:
+        return None
+    off, length, cls = layout[which], layout[3], layout[4]
+    return cls(packet[off : off + length])
+
+
+def ip_source(packet: bytes) -> IPAddress | None:
+    """Source address of an IPv4 or IPv6 packet, or None if it isn't one."""
+    return _ip_field(packet, 1)
+
+
+def ip_destination(packet: bytes) -> IPAddress | None:
+    """Destination address of an IPv4 or IPv6 packet, or None if it isn't one."""
+    return _ip_field(packet, 2)
