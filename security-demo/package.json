@@ -1,0 +1,16 @@
+{
+  "name": "security-demo",
+  "version": "1.0.0",
+  "description": "A **defensive** teaching demo for the scenario: *\"Someone hands me a frontend-only app. How do I tell whether it secretly captures credentials and phones home?\"*",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "acorn": "^8.14.0",
+    "acorn-walk": "^8.3.4"
+  }
+}
