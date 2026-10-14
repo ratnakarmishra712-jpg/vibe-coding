@@ -1,2 +1,6 @@
 # Stage 2 (pcap backend) needs scapy. Stage 1 has no dependencies.
 scapy>=2.5.0
+
+# Stage 3 (nfqueue inline enforcement) ALSO needs this (Linux + root +
+# system lib libnetfilter_queue). Not required for Stages 1-2 or the tests.
+# netfilterqueue>=1.1.0

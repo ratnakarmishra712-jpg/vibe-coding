@@ -40,6 +40,28 @@ there are outbound, everything else inbound (a capture file has no built-in
 direction). Point `--pcap` at any `.pcap`/`.pcapng` you captured with
 `tcpdump`/Wireshark to audit real traffic against your policy.
 
+### Stage 3 — live enforcement (Linux, root)
+
+This actually drops/allows real packets. **Do this on a throwaway VM, not a box
+you'd hate to lock yourself out of.**
+
+```bash
+pip install netfilterqueue              # needs libnetfilter_queue (apt: libnetfilter-queue-dev)
+sudo ./nfqueue_setup.sh up 0            # feed a NARROW slice (tcp :9999) to queue 0, fail-open
+sudo python3 -m ngfw --nfqueue 0 --home <your-ip>/32           # OBSERVE only — drops nothing
+sudo python3 -m ngfw --nfqueue 0 --home <your-ip>/32 --enforce # now it really DROPS denied packets
+sudo ./nfqueue_setup.sh down 0          # ALWAYS tear the rule down when finished
+```
+
+Safety rails baked in:
+- **Observe-only by default.** Without `--enforce`, every packet is accepted; you
+  only *see* the verdict it would apply. Trust your policy before enforcing.
+- **Fail-open rule.** `nfqueue_setup.sh` uses `--queue-bypass`, so if ngfw isn't
+  running, traffic passes — a crash can't silently cut your network.
+- **Narrow scope.** The setup script queues only one test port by default; widen
+  it on purpose by editing `TEST_MATCH`.
+- Never enforce on the port carrying your SSH session.
+
 Each line of output shows: the **verdict**, the **connection state** conntrack
 assigned (`new` / `established` / `invalid`), the packet, and **which rule
 decided it** — so you can watch the firewall think.
@@ -55,6 +77,8 @@ decided it** — so you can watch the firewall think.
 | `ngfw/backends/base.py` | The backend interface (the swappable plumbing). |
 | `ngfw/backends/simulated.py` | A scripted, safe data plane to experiment in. |
 | `ngfw/backends/pcap.py` | **Stage 2:** reads real packets from a capture via scapy and converts them to our `Packet`. |
+| `ngfw/backends/nfqueue.py` | **Stage 3:** inline enforcement on Linux — returns ACCEPT/DROP to the kernel via NFQUEUE. Observe-only unless `--enforce`. |
+| `nfqueue_setup.sh` | Safely adds/removes the iptables rule (fail-open, narrow scope) for the nfqueue backend. |
 | `make_sample_pcap.py` | Generates `sample.pcap` so the pcap backend runs out of the box. |
 | `rules.example.conf` | A commented starter policy. Edit it and re-run. |
 | `tests/` | Behaviour locked in so you can refactor fearlessly. |
@@ -85,8 +109,9 @@ Each stage adds a layer *on top of* the same engine. We'll do them one at a time
 - [x] **Stage 2 — Real packets (pcap backend):** read a `.pcap` with `scapy`,
       convert to our `Packet`, feed the *same* engine. Real data, still
       observe-only. (Live sniff is a small add-on; it needs root.)
-- [ ] **Stage 3 — Inline enforcement (NFQUEUE backend):** on Linux, actually
-      drop/allow live packets via netfilter. First "real" firewall.
+- [x] **Stage 3 — Inline enforcement (NFQUEUE backend):** on Linux, actually
+      drop/allow live packets via netfilter. Observe-only by default; `--enforce`
+      to really drop. First "real" firewall.
 - [ ] **Stage 4 — Layer 7 app-ID & DPI:** identify HTTP, TLS (SNI), DNS; match
       rules on *application*, not just port.
 - [ ] **Stage 5 — IDS/IPS:** signature engine (Suricata-style rules) + simple
