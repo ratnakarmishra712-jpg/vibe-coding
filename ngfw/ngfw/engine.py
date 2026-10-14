@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .conntrack import ConnTracker
+from .l7 import identify
 from .packet import Packet
 from .rules import Action, RuleSet
 
@@ -46,6 +47,16 @@ class Firewall:
     def evaluate(self, pkt: Packet) -> Verdict:
         self.stats["seen"] += 1
         state = self.ct.classify(pkt)
+
+        # Layer 7: identify this packet's app/host from its payload, then inherit
+        # whatever was already identified for the flow (SNI rides only the first
+        # packet, so later packets of the flow get it from conntrack memory).
+        pkt.meta.update(identify(pkt))
+        app, host = self.ct.flow_app_host(pkt)
+        if app and "app" not in pkt.meta:
+            pkt.meta["app"] = app
+        if host and "host" not in pkt.meta:
+            pkt.meta["host"] = host
 
         rule = self.rules.first_match(pkt, state)
         if rule is None:

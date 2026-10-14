@@ -48,8 +48,9 @@ class Packet:
     src_port: int = 0          # 0 for ICMP / protocols without ports
     dst_port: int = 0
     flags: TcpFlags = field(default_factory=TcpFlags)
-    length: int = 0            # payload size, for logging/stats
-    # L7 hints (filled in later by app-ID / DPI layers; empty for now)
+    length: int = 0            # packet size, for logging/stats
+    payload: bytes = b""       # L4 payload bytes, for L7 inspection (app-ID / DPI)
+    # L7 findings filled in by the app-ID layer: e.g. {'app':'tls','host':'x.com'}
     meta: dict = field(default_factory=dict)
 
     def five_tuple(self) -> tuple:

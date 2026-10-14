@@ -73,8 +73,13 @@ def from_scapy(sp, home_nets: list) -> Packet | None:
     else:
         proto = Proto.OTHER
 
+    # L4 payload bytes, for L7 app-ID (empty for ICMP / no-payload packets).
+    l4 = sp[TCP] if TCP in sp else sp[UDP] if UDP in sp else None
+    payload = bytes(l4.payload) if l4 is not None else b""
+
     direction = Direction.OUT if _is_home(src, home_nets) else Direction.IN
-    return Packet(direction, proto, src, dst, sport, dport, flags, length=len(sp))
+    return Packet(direction, proto, src, dst, sport, dport, flags,
+                  length=len(sp), payload=payload)
 
 
 class PcapBackend(Backend):

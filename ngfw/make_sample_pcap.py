@@ -10,7 +10,9 @@ Requires scapy (pip install scapy).
 """
 import os
 
-from scapy.all import IP, TCP, UDP, wrpcap
+from scapy.all import IP, TCP, UDP, Raw, wrpcap
+
+from ngfw.l7 import build_client_hello, build_dns_query
 
 ME = "10.0.0.5"
 DNS = "1.1.1.1"
@@ -28,6 +30,13 @@ def build():
         IP(src=WEB, dst=ME) / TCP(sport=443, dport=50001, flags="SA"),
         IP(src=ME, dst=WEB) / TCP(sport=50001, dport=443, flags="A"),
         IP(src=WEB, dst=ME) / TCP(sport=443, dport=50001, flags="A") / (b"x" * 1400),
+        # TLS ClientHello on that flow -> SNI example.com (allowed)
+        IP(src=ME, dst=WEB) / TCP(sport=50001, dport=443, flags="PA") / Raw(build_client_hello("example.com")),
+        # A new 443 flow to a tracker: SYN passes, then the ClientHello SNI is blocked
+        IP(src=ME, dst="142.250.1.1") / TCP(sport=50101, dport=443, flags="S"),
+        IP(src=ME, dst="142.250.1.1") / TCP(sport=50101, dport=443, flags="PA") / Raw(build_client_hello("ads.doubleclick.net")),
+        # DNS lookup for the tracker (blocked by the udp/53 host rule)
+        IP(src=ME, dst=DNS) / UDP(sport=40001, dport=53) / Raw(build_dns_query("ads.doubleclick.net")),
         # Inbound SSH attempt (allowed by explicit rule), Telnet (denied),
         # and an out-of-state ACK (invalid).
         IP(src=ATTACKER, dst=ME) / TCP(sport=51000, dport=22, flags="S"),

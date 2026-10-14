@@ -32,7 +32,10 @@ def _print_verdict(pkt, verdict) -> None:
     colour = {Action.ALLOW: GREEN, Action.DENY: RED, Action.REJECT: YELLOW}[verdict.action]
     tag = f"{colour}{verdict.action.value.upper():<6}{RESET}"
     state = f"{DIM}{verdict.state:<11}{RESET}"
-    print(f"{tag} {state} {pkt}   {DIM}# {verdict.reason}{RESET}")
+    l7 = ""
+    if pkt.meta.get("host"):
+        l7 = f"  {YELLOW}{pkt.meta.get('app', 'app')}:{pkt.meta['host']}{RESET}"
+    print(f"{tag} {state} {pkt}{l7}   {DIM}# {verdict.reason}{RESET}")
 
 
 def main(argv=None) -> int:

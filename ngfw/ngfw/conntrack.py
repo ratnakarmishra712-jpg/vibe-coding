@@ -38,6 +38,8 @@ class Connection:
     opener: tuple = ()              # (ip, port) of the side that sent the first packet
     packets: int = 0
     last_seen: float = field(default_factory=time.monotonic)
+    app: str = ""                   # L7 app once identified (e.g. 'tls','http','dns')
+    host: str = ""                  # L7 host/SNI once identified, remembered for the flow
 
 
 class ConnTracker:
@@ -64,6 +66,11 @@ class ConnTracker:
             return "invalid"
         return "new"
 
+    def flow_app_host(self, pkt: Packet) -> tuple[str, str]:
+        """Return (app, host) remembered for this packet's flow, or ('', '')."""
+        conn = self._t.get(_key(pkt))
+        return (conn.app, conn.host) if conn else ("", "")
+
     def update(self, pkt: Packet) -> Connection:
         """Record/advance state for a packet the engine decided to ALLOW."""
         k = _key(pkt)
@@ -71,6 +78,12 @@ class ConnTracker:
         if conn is None:
             conn = Connection(proto=pkt.proto, opener=(pkt.src_ip, pkt.src_port))
             self._t[k] = conn
+
+        # Remember the L7 identity on first sighting; it sticks to the whole flow.
+        if pkt.meta.get("app") and not conn.app:
+            conn.app = pkt.meta["app"]
+        if pkt.meta.get("host") and not conn.host:
+            conn.host = pkt.meta["host"]
 
         if pkt.proto == Proto.TCP:
             f = pkt.flags

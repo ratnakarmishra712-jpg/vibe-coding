@@ -74,6 +74,7 @@ decided it** — so you can watch the firewall think.
 | `ngfw/rules.py` | A human-readable policy file + matcher. First-match-wins, like real firewalls. |
 | `ngfw/conntrack.py` | **Connection tracking** — the difference between a dumb ACL and a *stateful* firewall. |
 | `ngfw/engine.py` | The decision loop: conntrack → rules → verdict, with **default-deny**. |
+| `ngfw/l7.py` | **Stage 4:** app-ID — parses TLS SNI / HTTP Host / DNS names from payloads (defensively), plus builders for realistic test bytes. |
 | `ngfw/backends/base.py` | The backend interface (the swappable plumbing). |
 | `ngfw/backends/simulated.py` | A scripted, safe data plane to experiment in. |
 | `ngfw/backends/pcap.py` | **Stage 2:** reads real packets from a capture via scapy and converts them to our `Packet`. |
@@ -99,6 +100,10 @@ demo, watch the DNS reply and the TCP handshake replies come back in as
 3. Add a rule to allow inbound ICMP (ping) and craft a packet for it.
 4. Flip the default policy to `allow` in `__main__.py` and see why default-deny
    is the safe industry norm.
+5. **App-aware (Stage 4):** add `deny out tcp any any 443 any *.example.com` above
+   the allow-out rule, then watch the demo block the `example.com` TLS flow by its
+   SNI while leaving other 443 traffic alone. Change the port to see that app-ID,
+   not the port, is doing the work.
 
 ## Roadmap — how this grows into a NGFW
 
@@ -112,8 +117,10 @@ Each stage adds a layer *on top of* the same engine. We'll do them one at a time
 - [x] **Stage 3 — Inline enforcement (NFQUEUE backend):** on Linux, actually
       drop/allow live packets via netfilter. Observe-only by default; `--enforce`
       to really drop. First "real" firewall.
-- [ ] **Stage 4 — Layer 7 app-ID & DPI:** identify HTTP, TLS (SNI), DNS; match
-      rules on *application*, not just port.
+- [x] **Stage 4 — Layer 7 app-ID:** parse TLS SNI, HTTP Host, and DNS names from
+      payloads; remember the host on the flow (conntrack); match rules on an
+      optional 8th `host` field (exact or `*.suffix`). Block `*.doubleclick.net`
+      on port 443 while allowing other 443 traffic.
 - [ ] **Stage 5 — IDS/IPS:** signature engine (Suricata-style rules) + simple
       anomaly checks (port-scan, SYN-flood detection).
 - [ ] **Stage 6 — NGFW extras:** TLS/SNI policy, GeoIP, logging to JSON/syslog,

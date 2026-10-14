@@ -14,12 +14,14 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from ..l7 import build_client_hello, build_dns_query
 from ..packet import Direction, Packet, Proto, TcpFlags
 from .base import Backend
 
 SYN = TcpFlags(syn=True)
 SYNACK = TcpFlags(syn=True, ack=True)
 ACK = TcpFlags(ack=True)
+PSH = TcpFlags(ack=True)   # a data-carrying segment (ACK set)
 
 
 def default_scenario() -> list[Packet]:
@@ -51,6 +53,26 @@ def default_scenario() -> list[Packet]:
         # 6) Out-of-state attack: a bare ACK to a high port with NO prior flow.
         #    Not 'established' (we never saw a handshake) and no 'new' rule -> DENY.
         Packet(Direction.IN, Proto.TCP, attacker, me, 51002, 50505, ACK, 40),
+
+        # --- Layer 7 (Stage 4): app-ID looks INSIDE the payload ---------------
+        # 7) The TLS ClientHello for the web flow we opened above (port 50001)
+        #    carries SNI=example.com. It's established; host rule doesn't match
+        #    example.com -> ALLOW, and conntrack remembers the host.
+        Packet(Direction.OUT, Proto.TCP, me, web, 50001, 443, PSH, 250,
+               payload=build_client_hello("example.com")),
+
+        # 8) Now a connection to a TRACKER on the same port 443. The SYN alone
+        #    reveals no host, so it's allowed — just like a real NGFW, which
+        #    can't block until it has seen the ClientHello.
+        Packet(Direction.OUT, Proto.TCP, me, "142.250.1.1", 50101, 443, SYN, 60),
+        # 9) ...then the ClientHello arrives with SNI=ads.doubleclick.net. NOW
+        #    app-ID identifies it and the host rule DROPS it (same port 443!).
+        Packet(Direction.OUT, Proto.TCP, me, "142.250.1.1", 50101, 443, PSH, 250,
+               payload=build_client_hello("ads.doubleclick.net")),
+
+        # 10) A DNS lookup for the tracker is blocked too (host rule on udp/53).
+        Packet(Direction.OUT, Proto.UDP, me, dns, 40001, 53, length=60,
+               payload=build_dns_query("ads.doubleclick.net")),
     ]
 
 

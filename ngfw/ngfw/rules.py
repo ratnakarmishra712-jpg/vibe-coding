@@ -16,6 +16,10 @@ Fields:
   src, dst   an IP, a CIDR (e.g. 10.0.0.0/8), or 'any'
   dport      a port, or 'any'
   state      comma list of: new, established, any   (stateful matching)
+  host       (OPTIONAL 8th field) L7 host matcher for app-aware rules: an exact
+             name, a '*.suffix' wildcard, or 'any' (the default when omitted).
+             Matches the flow's TLS SNI / HTTP Host / DNS name, e.g.:
+                 deny out tcp any any 443 any *.doubleclick.net
 
 Rules are evaluated top-to-bottom; the FIRST match wins. If nothing matches,
 the engine applies its default policy (deny).
@@ -44,6 +48,21 @@ def _match_host(spec: str, ip: str) -> bool:
         return spec == ip
 
 
+def _match_name(spec: str, name: str) -> bool:
+    """L7 hostname matching. 'any' matches everything (incl. unidentified flows);
+    a concrete spec requires a known name, exact or '*.suffix' wildcard."""
+    if spec == "any":
+        return True
+    if not name:
+        return False                      # rule wants a host but the flow has none
+    name = name.lower()
+    spec = spec.lower()
+    if spec.startswith("*."):
+        suffix = spec[1:]                 # '*.doubleclick.net' -> '.doubleclick.net'
+        return name == spec[2:] or name.endswith(suffix)
+    return name == spec
+
+
 @dataclass
 class Rule:
     action: Action
@@ -53,6 +72,7 @@ class Rule:
     dst: str                # ip / cidr / 'any'
     dport: str              # port number as str, or 'any'
     states: frozenset       # subset of {'new','established'} or {'any'}
+    host: str = "any"       # L7 host matcher: exact / '*.suffix' / 'any'
     raw: str = ""           # original line, for logging
     lineno: int = 0
 
@@ -68,6 +88,8 @@ class Rule:
         if not _match_host(self.dst, pkt.dst_ip):
             return False
         if "any" not in self.states and conn_state not in self.states:
+            return False
+        if not _match_name(self.host, pkt.meta.get("host", "")):
             return False
         return True
 
@@ -91,12 +113,13 @@ class RuleSet:
             if not line:
                 continue
             parts = line.split()
-            if len(parts) != 7:
+            if len(parts) not in (7, 8):
                 raise ValueError(
-                    f"rule line {i}: expected 7 fields "
-                    f"(action direction proto src dst dport state), got {len(parts)}: {line!r}"
+                    f"rule line {i}: expected 7 or 8 fields "
+                    f"(action direction proto src dst dport state [host]), got {len(parts)}: {line!r}"
                 )
-            action, direction, proto, src, dst, dport, state = parts
+            action, direction, proto, src, dst, dport, state = parts[:7]
+            host = parts[7] if len(parts) == 8 else "any"
             rules.append(Rule(
                 action=Action(action.lower()),
                 direction=direction.lower(),
@@ -105,6 +128,7 @@ class RuleSet:
                 dst=dst,
                 dport=dport.lower(),
                 states=frozenset(s.strip() for s in state.lower().split(",")),
+                host=host.lower(),
                 raw=line,
                 lineno=i,
             ))
