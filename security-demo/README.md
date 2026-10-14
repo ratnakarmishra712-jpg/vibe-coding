@@ -19,9 +19,28 @@ This kit teaches you to *find* a credential-harvesting backdoor, not to build on
 |------|---------|
 | `sample-app/index.html` | A benign demo page with a login form. Inert. |
 | `sample-app/app.js` | Benign app logic. Contains commented **marker strings** a scanner should flag — but no working exfiltration. |
-| `scan.sh` | Static-analysis scanner. Greps a directory for backdoor indicators and prints a report. |
-| `indicators.md` | The checklist of what the scanner looks for and why each pattern matters. |
-| `csp-and-sri.md` | The actual countermeasure: Content-Security-Policy + Subresource Integrity configs that block a frontend from exfiltrating to unapproved origins. |
+| `scan.sh` | Grep-based indicator scanner. Fast, zero-dependency — but matches text, so it false-positives on comments/strings. |
+| `sast-scan.js` | **AST-based taint scanner.** Parses the real code and tracks data flow from SOURCES (reading secrets) to SINKS (network calls). Flags source→sink flows and external destinations. Needs `npm install`. |
+| `test-fixtures/beacon.js` | A benign-but-flaggable fixture (an analytics beacon — *not* a stealer) to exercise the taint engine. |
+| `indicators.md` | The checklist of what the scanners look for and why each pattern matters. |
+| `csp-and-sri.md` | Countermeasure: Content-Security-Policy + Subresource Integrity configs that block a frontend from exfiltrating to unapproved origins. |
+| `telemetry-and-reports.md` | How to read CSP violation reports and AV/EDR telemetry during a live engagement. |
+
+## grep vs. AST — the lesson
+
+Run both against `sample-app/` (whose "suspicious" markers live in **comments**):
+
+- `scan.sh sample-app` → flags **6** patterns (all false positives — text in comments).
+- `node sast-scan.js sample-app` → **0** findings (the AST doesn't see comments; it reasons about executable code and real data flow).
+
+Then run the AST scanner against the fixture to see it catch genuine flows, and
+watch the allowlist downgrade HIGH→MED instead of silencing:
+
+```bash
+npm install                                   # acorn + acorn-walk
+node sast-scan.js test-fixtures               # 2 HIGH: tainted data -> external host
+node sast-scan.js test-fixtures --allow analytics.example   # downgraded to MED
+```
 
 ## Run the demo
 
