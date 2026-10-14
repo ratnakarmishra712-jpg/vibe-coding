@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from . import protocol
+from . import crypto, protocol
 from .protocol import ProtocolError
 
 log = logging.getLogger(__name__)
@@ -27,23 +27,32 @@ REKEY_INTERVAL = 600.0
 
 @dataclass
 class _ServerPeer:
+    public_key: bytes
     tunnel_ip: ipaddress.IPv4Address
-    session: protocol.Session
-    addr: Addr
-    last_init_ts: int
+    session: protocol.Session | None = None
+    addr: Addr | None = None
+    # Highest handshake timestamp accepted, kept after a session expires so a
+    # captured INIT can never be replayed to hijack the peer.
+    last_init_ts: int = -1
 
 
 class Server:
-    def __init__(self, psk: bytes, interface: ipaddress.IPv4Interface, send: SendFn, tun_write: TunWriteFn) -> None:
-        self.psk = psk
+    def __init__(self, static: crypto.KeyPair, interface: ipaddress.IPv4Interface,
+                 peers: dict[bytes, ipaddress.IPv4Address], send: SendFn, tun_write: TunWriteFn) -> None:
+        self.static = static
         self.interface = interface
         self.send = send
         self.tun_write = tun_write
-        self.peers: dict[ipaddress.IPv4Address, _ServerPeer] = {}
+        reserved = {interface.ip, interface.network.network_address, interface.network.broadcast_address}
+        self.peers: dict[bytes, _ServerPeer] = {}
+        self.by_ip: dict[ipaddress.IPv4Address, _ServerPeer] = {}
+        for key, ip in peers.items():
+            if ip not in interface.network or ip in reserved:
+                raise ValueError(f"peer address {ip} is not usable in {interface.network}")
+            if ip in self.by_ip:
+                raise ValueError(f"peer address {ip} assigned twice")
+            self.peers[key] = self.by_ip[ip] = _ServerPeer(key, ip)
         self.by_index: dict[int, _ServerPeer] = {}
-        # Highest handshake timestamp seen per tunnel IP, kept even after a session expires
-        # so a captured INIT can never be replayed to hijack an address.
-        self.last_init_ts: dict[ipaddress.IPv4Address, int] = {}
 
     def handle_datagram(self, data: bytes, addr: Addr) -> None:
         try:
@@ -58,25 +67,22 @@ class Server:
             log.debug("dropping datagram from %s: %s", addr, e)
 
     def _handle_init(self, data: bytes, addr: Addr) -> None:
-        init = protocol.parse_init(self.psk, data)
-        ip = init.tunnel_ip
-        if ip not in self.interface.network or ip in (self.interface.ip, self.interface.network.network_address,
-                                                       self.interface.network.broadcast_address):
-            raise ProtocolError(f"tunnel IP {ip} not allowed")
-        if init.timestamp_ns <= self.last_init_ts.get(ip, -1):
+        init = protocol.parse_init(self.static, data)
+        peer = self.peers.get(init.static_public)
+        if peer is None:
+            raise ProtocolError(f"unknown peer key {crypto.encode_key(init.static_public)}")
+        if init.timestamp_ns <= peer.last_init_ts:
             raise ProtocolError("stale or replayed init")
-        packet, session = protocol.respond(self.psk, init)
-        self._drop(ip)
-        peer = _ServerPeer(ip, session, addr, init.timestamp_ns)
-        self.peers[ip] = peer
+        packet, session = protocol.respond(init)
+        self._end_session(peer)
+        peer.session, peer.addr, peer.last_init_ts = session, addr, init.timestamp_ns
         self.by_index[session.local_idx] = peer
-        self.last_init_ts[ip] = init.timestamp_ns
         self.send(packet, addr)
-        log.info("peer %s connected from %s:%d", ip, *addr)
+        log.info("peer %s (%s) connected from %s:%d", peer.tunnel_ip, crypto.encode_key(peer.public_key), *addr)
 
     def _handle_data(self, data: bytes, addr: Addr) -> None:
         peer = self.by_index.get(protocol.data_receiver_index(data))
-        if peer is None:
+        if peer is None or peer.session is None:
             raise ProtocolError("unknown session")
         payload = peer.session.open(data)
         peer.addr = addr  # authenticated packet: follow the peer if it roams
@@ -88,29 +94,29 @@ class Server:
 
     def handle_tun(self, packet: bytes) -> None:
         dst = protocol.ipv4_destination(packet)
-        peer = self.peers.get(dst) if dst else None
-        if peer is None:
+        peer = self.by_ip.get(dst) if dst else None
+        if peer is None or peer.session is None:
             return
         self.send(peer.session.seal(packet), peer.addr)
 
     def tick(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
-        for ip, peer in list(self.peers.items()):
-            if now - peer.session.last_received > SESSION_TIMEOUT:
-                log.info("peer %s timed out", ip)
-                self._drop(ip)
+        for peer in self.peers.values():
+            if peer.session is not None and now - peer.session.last_received > SESSION_TIMEOUT:
+                log.info("peer %s timed out", peer.tunnel_ip)
+                self._end_session(peer)
 
-    def _drop(self, ip: ipaddress.IPv4Address) -> None:
-        peer = self.peers.pop(ip, None)
-        if peer is not None:
+    def _end_session(self, peer: _ServerPeer) -> None:
+        if peer.session is not None:
             self.by_index.pop(peer.session.local_idx, None)
+            peer.session = None
 
 
 class Client:
-    def __init__(self, psk: bytes, tunnel_ip: ipaddress.IPv4Address, server: Addr,
+    def __init__(self, static: crypto.KeyPair, server_public: bytes, server: Addr,
                  send: SendFn, tun_write: TunWriteFn) -> None:
-        self.psk = psk
-        self.tunnel_ip = tunnel_ip
+        self.static = static
+        self.server_public = server_public
         self.server = server
         self.send = send
         self.tun_write = tun_write
@@ -126,7 +132,7 @@ class Client:
         return self.session is not None
 
     def start_handshake(self, now: float | None = None) -> None:
-        self.pending = protocol.create_init(self.psk, self.tunnel_ip)
+        self.pending = protocol.create_init(self.static, self.server_public)
         self.last_init_sent = time.monotonic() if now is None else now
         self.send(self.pending.packet, self.server)
 
@@ -147,7 +153,7 @@ class Client:
     def _handle_response(self, data: bytes) -> None:
         if self.pending is None:
             raise ProtocolError("no handshake in progress")
-        session = protocol.complete(self.psk, self.pending, data)
+        session = protocol.complete(self.static, self.pending, data)
         self.pending = None
         self.previous, self.session = self.session, session
         self.session_started = time.monotonic()

@@ -1,13 +1,21 @@
 import ipaddress
+import os
 import struct
+import tempfile
 import unittest
 
 from vpn import crypto, protocol
+from vpn.__main__ import load_peers
 from vpn.node import SESSION_TIMEOUT, Client, Server
 
-PSK = bytes(range(32))
+SERVER_KEY = crypto.KeyPair.generate()
+ALICE = crypto.KeyPair.generate()
+BOB = crypto.KeyPair.generate()
+MALLORY = crypto.KeyPair.generate()
+ALICE_IP = ipaddress.IPv4Address("10.8.0.2")
+BOB_IP = ipaddress.IPv4Address("10.8.0.3")
 SERVER_ADDR = ("192.0.2.1", 51820)
-CLIENT_ADDR = ("198.51.100.7", 40000)
+PEERS = {ALICE.public: ALICE_IP, BOB.public: BOB_IP}
 
 
 def ipv4_packet(src: str, dst: str, payload: bytes = b"hello") -> bytes:
@@ -16,29 +24,35 @@ def ipv4_packet(src: str, dst: str, payload: bytes = b"hello") -> bytes:
     return header + payload
 
 
-class Harness:
-    """Wires a Server and Client together through in-memory queues."""
+class Network:
+    """Wires a Server and any number of Clients together through an in-memory queue."""
 
-    def __init__(self, client_ip="10.8.0.2", client_psk=PSK):
+    def __init__(self):
         self.wire: list[tuple[bytes, tuple, tuple]] = []  # (data, src, dst)
         self.server_tun: list[bytes] = []
-        self.client_tun: list[bytes] = []
-        self.server = Server(PSK, ipaddress.IPv4Interface("10.8.0.1/24"),
+        self.server = Server(SERVER_KEY, ipaddress.IPv4Interface("10.8.0.1/24"), PEERS,
                              lambda d, a: self.wire.append((d, SERVER_ADDR, a)), self.server_tun.append)
-        self.client = Client(client_psk, ipaddress.IPv4Address(client_ip), SERVER_ADDR,
-                             lambda d, a: self.wire.append((d, CLIENT_ADDR, a)), self.client_tun.append)
+        self.clients: dict[tuple, Client] = {}
+        self.client_tun: dict[tuple, list[bytes]] = {}
+
+    def add_client(self, key, addr, server_public=SERVER_KEY.public) -> Client:
+        self.client_tun[addr] = []
+        client = Client(key, server_public, SERVER_ADDR,
+                        lambda d, a: self.wire.append((d, addr, a)), self.client_tun[addr].append)
+        self.clients[addr] = client
+        return client
 
     def deliver(self):
         delivered = []
         while self.wire:
             data, src, dst = self.wire.pop(0)
             delivered.append(data)
-            node = self.server if dst == SERVER_ADDR else self.client
+            node = self.server if dst == SERVER_ADDR else self.clients[dst]
             node.handle_datagram(data, src)
         return delivered
 
-    def connect(self):
-        self.client.start_handshake()
+    def connect(self, client):
+        client.start_handshake()
         return self.deliver()
 
 
@@ -57,28 +71,43 @@ class ReplayWindowTest(unittest.TestCase):
 
 
 class HandshakeTest(unittest.TestCase):
-    def test_keys_match(self):
-        pending = protocol.create_init(PSK, ipaddress.IPv4Address("10.8.0.2"))
-        info = protocol.parse_init(PSK, pending.packet)
-        resp, server_session = protocol.respond(PSK, info)
-        client_session = protocol.complete(PSK, pending, resp)
+    def handshake(self):
+        pending = protocol.create_init(ALICE, SERVER_KEY.public)
+        info = protocol.parse_init(SERVER_KEY, pending.packet)
+        resp, server_session = protocol.respond(info)
+        return info, server_session, protocol.complete(ALICE, pending, resp)
+
+    def test_keys_match_and_identity_revealed(self):
+        info, server_session, client_session = self.handshake()
+        self.assertEqual(info.static_public, ALICE.public)
         self.assertEqual(server_session.open(client_session.seal(b"ping")), b"ping")
         self.assertEqual(client_session.open(server_session.seal(b"pong")), b"pong")
 
-    def test_wrong_psk_rejected(self):
-        pending = protocol.create_init(bytes(32), ipaddress.IPv4Address("10.8.0.2"))
+    def test_static_key_not_sent_in_clear(self):
+        pending = protocol.create_init(ALICE, SERVER_KEY.public)
+        self.assertNotIn(ALICE.public, pending.packet)
+
+    def test_init_for_other_server_rejected(self):
+        pending = protocol.create_init(ALICE, MALLORY.public)
         with self.assertRaises(protocol.ProtocolError):
-            protocol.parse_init(PSK, pending.packet)
+            protocol.parse_init(SERVER_KEY, pending.packet)
 
     def test_stale_timestamp_rejected(self):
-        pending = protocol.create_init(PSK, ipaddress.IPv4Address("10.8.0.2"), now_ns=0)
+        pending = protocol.create_init(ALICE, SERVER_KEY.public, now_ns=0)
         with self.assertRaises(protocol.ProtocolError):
-            protocol.parse_init(PSK, pending.packet)
+            protocol.parse_init(SERVER_KEY, pending.packet)
+
+    def test_response_from_impostor_server_rejected(self):
+        pending = protocol.create_init(ALICE, SERVER_KEY.public)
+        # Mallory can't decrypt the init, so the best they can do is answer with their own keys.
+        fake = protocol.InitInfo(protocol._INIT_HDR.unpack_from(pending.packet)[1], pending.ephemeral.public,
+                                 ALICE.public, 0, protocol._Symmetric.initial(MALLORY.public))
+        resp, _ = protocol.respond(fake)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.complete(ALICE, pending, resp)
 
     def test_tampered_data_rejected(self):
-        pending = protocol.create_init(PSK, ipaddress.IPv4Address("10.8.0.2"))
-        resp, server_session = protocol.respond(PSK, protocol.parse_init(PSK, pending.packet))
-        client_session = protocol.complete(PSK, pending, resp)
+        _, server_session, client_session = self.handshake()
         pkt = bytearray(client_session.seal(b"secret"))
         pkt[-1] ^= 1
         with self.assertRaises(protocol.ProtocolError):
@@ -87,84 +116,132 @@ class HandshakeTest(unittest.TestCase):
 
 class EndToEndTest(unittest.TestCase):
     def test_traffic_flows_both_ways(self):
-        h = Harness()
-        h.connect()
-        self.assertTrue(h.client.connected)
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        net.connect(alice)
+        self.assertTrue(alice.connected)
 
         out = ipv4_packet("10.8.0.2", "10.8.0.1")
-        h.client.handle_tun(out)
-        h.deliver()
-        self.assertEqual(h.server_tun, [out])
+        alice.handle_tun(out)
+        net.deliver()
+        self.assertEqual(net.server_tun, [out])
 
         back = ipv4_packet("10.8.0.1", "10.8.0.2", b"world")
-        h.server.handle_tun(back)
-        h.deliver()
-        self.assertEqual(h.client_tun, [back])
+        net.server.handle_tun(back)
+        net.deliver()
+        self.assertEqual(net.client_tun[("198.51.100.7", 40000)], [back])
+
+    def test_two_clients_routed_separately(self):
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        bob = net.add_client(BOB, ("198.51.100.8", 40000))
+        net.connect(alice)
+        net.connect(bob)
+        to_bob = ipv4_packet("10.8.0.1", "10.8.0.3")
+        net.server.handle_tun(to_bob)
+        net.deliver()
+        self.assertEqual(net.client_tun[("198.51.100.8", 40000)], [to_bob])
+        self.assertEqual(net.client_tun[("198.51.100.7", 40000)], [])
+
+    def test_unknown_key_rejected(self):
+        net = Network()
+        mallory = net.add_client(MALLORY, ("203.0.113.66", 1234))
+        net.connect(mallory)
+        self.assertFalse(mallory.connected)
+        self.assertEqual(net.server.by_index, {})
+
+    def test_cannot_impersonate_with_only_public_key(self):
+        net = Network()
+        impostor = crypto.KeyPair.from_bytes(MALLORY.private_bytes())
+        impostor.public = ALICE.public  # claims Alice's identity without her private key
+        client = net.add_client(impostor, ("203.0.113.66", 1234))
+        net.connect(client)
+        self.assertFalse(client.connected)
+        self.assertEqual(net.server.by_index, {})
+
+    def test_wrong_server_key_never_connects(self):
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000), server_public=MALLORY.public)
+        net.connect(alice)
+        self.assertFalse(alice.connected)
+
+    def test_peer_cannot_use_another_peers_ip(self):
+        net = Network()
+        bob = net.add_client(BOB, ("198.51.100.8", 40000))
+        net.connect(bob)
+        bob.handle_tun(ipv4_packet("10.8.0.2", "10.8.0.1"))  # Bob pretends to be Alice
+        net.deliver()
+        self.assertEqual(net.server_tun, [])
 
     def test_replayed_data_dropped(self):
-        h = Harness()
-        h.connect()
-        h.client.handle_tun(ipv4_packet("10.8.0.2", "10.8.0.1"))
-        [data] = h.deliver()
-        h.server.handle_datagram(data, CLIENT_ADDR)
-        self.assertEqual(len(h.server_tun), 1)
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        net.connect(alice)
+        alice.handle_tun(ipv4_packet("10.8.0.2", "10.8.0.1"))
+        [data] = net.deliver()
+        net.server.handle_datagram(data, ("198.51.100.7", 40000))
+        self.assertEqual(len(net.server_tun), 1)
 
     def test_replayed_init_cannot_hijack(self):
-        h = Harness()
-        init, *_ = h.connect()
-        attacker = ("203.0.113.66", 1234)
-        h.server.handle_datagram(init, attacker)
-        self.assertEqual(h.server.peers[ipaddress.IPv4Address("10.8.0.2")].addr, CLIENT_ADDR)
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        init, *_ = net.connect(alice)
+        net.server.handle_datagram(init, ("203.0.113.66", 1234))
+        self.assertEqual(net.server.peers[ALICE.public].addr, ("198.51.100.7", 40000))
 
-    def test_spoofed_inner_source_dropped(self):
-        h = Harness()
-        h.connect()
-        h.client.handle_tun(ipv4_packet("10.8.0.99", "10.8.0.1"))
-        h.deliver()
-        self.assertEqual(h.server_tun, [])
-
-    def test_wrong_psk_never_connects(self):
-        h = Harness(client_psk=bytes(32))
-        h.connect()
-        self.assertFalse(h.client.connected)
-        self.assertEqual(h.server.peers, {})
-
-    def test_ip_outside_subnet_rejected(self):
-        h = Harness(client_ip="10.9.0.2")
-        h.connect()
-        self.assertFalse(h.client.connected)
+    def test_forged_response_does_not_break_handshake(self):
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        alice.start_handshake()
+        idx = alice.pending.local_idx
+        alice.handle_datagram(struct.pack("!BII", protocol.MSG_RESPONSE, 1, idx) + os.urandom(48), SERVER_ADDR)
+        net.deliver()
+        self.assertTrue(alice.connected)
 
     def test_rekey_keeps_traffic_flowing(self):
-        h = Harness()
-        h.connect()
-        first = h.client.session
-        h.connect()
-        self.assertIsNot(h.client.session, first)
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        net.connect(alice)
+        first = alice.session
+        net.connect(alice)
+        self.assertIsNot(alice.session, first)
         back = ipv4_packet("10.8.0.1", "10.8.0.2")
-        h.server.handle_tun(back)
-        h.deliver()
-        self.assertEqual(h.client_tun, [back])
+        net.server.handle_tun(back)
+        net.deliver()
+        self.assertEqual(net.client_tun[("198.51.100.7", 40000)], [back])
 
     def test_server_expires_idle_peer(self):
-        h = Harness()
-        h.connect()
-        peer = h.server.peers[ipaddress.IPv4Address("10.8.0.2")]
-        h.server.tick(now=peer.session.last_received + SESSION_TIMEOUT + 1)
-        self.assertEqual(h.server.peers, {})
-        self.assertEqual(h.server.by_index, {})
+        net = Network()
+        alice = net.add_client(ALICE, ("198.51.100.7", 40000))
+        net.connect(alice)
+        peer = net.server.peers[ALICE.public]
+        net.server.tick(now=peer.session.last_received + SESSION_TIMEOUT + 1)
+        self.assertIsNone(peer.session)
+        self.assertEqual(net.server.by_index, {})
 
 
-class CryptoTest(unittest.TestCase):
-    def test_load_psk_validates_length(self):
-        import os
-        import tempfile
+class ConfigTest(unittest.TestCase):
+    def test_key_roundtrip(self):
+        self.assertEqual(crypto.decode_key(crypto.encode_key(ALICE.public)), ALICE.public)
+        with self.assertRaises(ValueError):
+            crypto.decode_key("abcd")
+
+    def test_load_peers(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
-            f.write("abcd\n")
+            f.write(f"# comment\n{crypto.encode_key(ALICE.public)} 10.8.0.2\n\n")
         try:
-            with self.assertRaises(ValueError):
-                crypto.load_psk(f.name)
+            peers = load_peers(f.name, [f"{crypto.encode_key(BOB.public)}=10.8.0.3"])
         finally:
             os.unlink(f.name)
+        self.assertEqual(peers, PEERS)
+
+    def test_server_rejects_bad_peer_config(self):
+        iface = ipaddress.IPv4Interface("10.8.0.1/24")
+        for peers in ({ALICE.public: ipaddress.IPv4Address("10.9.0.2")},
+                      {ALICE.public: ipaddress.IPv4Address("10.8.0.1")},
+                      {ALICE.public: ALICE_IP, BOB.public: ALICE_IP}):
+            with self.assertRaises(ValueError):
+                Server(SERVER_KEY, iface, peers, lambda d, a: None, lambda p: None)
 
 
 if __name__ == "__main__":

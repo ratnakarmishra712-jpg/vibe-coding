@@ -2,13 +2,15 @@
 
 Messages (all integers big-endian unless noted):
 
-  INIT     type=1 | sender_idx(4) | eph_pub(32) | timestamp_ns(8) | tunnel_ip(4) | mac(32)
-  RESPONSE type=2 | sender_idx(4) | receiver_idx(4) | eph_pub(32) | mac(32)
+  INIT     type=1 | sender_idx(4) | eph_pub(32) | enc(static_pub)(32+16) | enc(timestamp_ns)(8+16)
+  RESPONSE type=2 | sender_idx(4) | receiver_idx(4) | eph_pub(32) | enc(empty)(16)
   DATA     type=3 | receiver_idx(4) | counter(8) | ciphertext+tag
 
-The INIT mac covers the message; the RESPONSE mac covers the response plus the
-full INIT it answers, binding the two together. DATA headers are authenticated
-as AEAD associated data. An empty DATA payload is a keepalive.
+The handshake follows the Noise IK pattern (`-> e, es, s, ss` / `<- e, ee, se`):
+the initiator's static key travels encrypted, every encryption is bound to the
+running transcript hash, and only the holders of the expected static private
+keys can derive the session keys. DATA headers are authenticated as AEAD
+associated data. An empty DATA payload is a keepalive.
 """
 
 import ipaddress
@@ -17,20 +19,21 @@ import struct
 import time
 from dataclasses import dataclass, field
 
-from cryptography.exceptions import InvalidTag
-
 from . import crypto
 
 MSG_INIT = 1
 MSG_RESPONSE = 2
 MSG_DATA = 3
 
-_INIT_BODY = struct.Struct("!BI32sQ4s")
-_RESP_BODY = struct.Struct("!BII32s")
+_INIT_HDR = struct.Struct("!BI")
+_RESP_HDR = struct.Struct("!BII")
 _DATA_HDR = struct.Struct("!BIQ")
+_ENC_STATIC_LEN = crypto.KEY_LEN + crypto.TAG_LEN
+_ENC_TS_LEN = 8 + crypto.TAG_LEN
 
-INIT_LEN = _INIT_BODY.size + crypto.MAC_LEN
-RESP_LEN = _RESP_BODY.size + crypto.MAC_LEN
+CONSTRUCTION = b"vibe-vpn v2 Noise_IK_25519_ChaChaPoly_SHA256"
+INIT_LEN = _INIT_HDR.size + crypto.KEY_LEN + _ENC_STATIC_LEN + _ENC_TS_LEN
+RESP_LEN = _RESP_HDR.size + crypto.KEY_LEN + crypto.TAG_LEN
 DATA_HDR_LEN = _DATA_HDR.size
 
 # Handshakes older than this (or from the future by more than this) are rejected.
@@ -107,8 +110,8 @@ class Session:
             raise ProtocolError("replayed or too-old packet")
         try:
             payload = self.recv_cipher.decrypt(counter, packet[DATA_HDR_LEN:], header)
-        except InvalidTag:
-            raise ProtocolError("authentication failed") from None
+        except crypto.CryptoError as e:
+            raise ProtocolError(str(e)) from None
         # Only advance the window after authentication succeeds.
         self.replay.update(counter)
         self.last_received = time.monotonic()
@@ -121,7 +124,41 @@ def data_receiver_index(packet: bytes) -> int:
     return _DATA_HDR.unpack_from(packet)[1]
 
 
-# --- Handshake ------------------------------------------------------------
+# --- Handshake (Noise IK: initiator knows the responder's static key) ------
+
+
+@dataclass
+class _Symmetric:
+    """Noise chaining key `ck` and transcript hash `h`."""
+
+    ck: bytes
+    h: bytes
+
+    @classmethod
+    def initial(cls, responder_static: bytes) -> "_Symmetric":
+        ck = crypto.hash_(CONSTRUCTION)
+        return cls(ck, crypto.hash_(ck, responder_static))
+
+    def mix_hash(self, data: bytes) -> None:
+        self.h = crypto.hash_(self.h, data)
+
+    def mix_key(self, material: bytes) -> bytes:
+        self.ck, key = crypto.kdf(self.ck, material, 2)
+        return key
+
+    def encrypt(self, key: bytes, plaintext: bytes) -> bytes:
+        ct = crypto.Cipher(key).encrypt(0, plaintext, self.h)
+        self.mix_hash(ct)
+        return ct
+
+    def decrypt(self, key: bytes, ciphertext: bytes) -> bytes:
+        pt = crypto.Cipher(key).decrypt(0, ciphertext, self.h)
+        self.mix_hash(ciphertext)
+        return pt
+
+    def split(self) -> tuple[bytes, bytes]:
+        k_i2r, k_r2i = crypto.kdf(self.ck, b"", 2)
+        return k_i2r, k_r2i
 
 
 @dataclass
@@ -129,61 +166,93 @@ class PendingInit:
     """Initiator-side state while waiting for a RESPONSE."""
 
     local_idx: int
-    ephemeral: crypto.Ephemeral
+    ephemeral: crypto.KeyPair
+    state: _Symmetric
     packet: bytes
 
 
 @dataclass
 class InitInfo:
+    """A decrypted, authenticated INIT. The caller must still check `static_public` is a known peer."""
+
     sender_idx: int
-    eph_pub: bytes
+    ephemeral_public: bytes
+    static_public: bytes
     timestamp_ns: int
-    tunnel_ip: ipaddress.IPv4Address
-    packet: bytes
+    state: _Symmetric
 
 
-def create_init(psk: bytes, tunnel_ip: ipaddress.IPv4Address, now_ns: int | None = None) -> PendingInit:
-    eph = crypto.Ephemeral()
+def create_init(static: crypto.KeyPair, responder_public: bytes, now_ns: int | None = None) -> PendingInit:
+    st = _Symmetric.initial(responder_public)
+    eph = crypto.KeyPair.generate()
     idx = new_index()
     ts = time.time_ns() if now_ns is None else now_ns
-    body = _INIT_BODY.pack(MSG_INIT, idx, eph.public, ts, tunnel_ip.packed)
-    packet = body + crypto.compute_mac(crypto.mac_key(psk), body)
-    return PendingInit(idx, eph, packet)
+    try:
+        st.mix_hash(eph.public)
+        st.mix_key(eph.public)
+        enc_static = st.encrypt(st.mix_key(eph.dh(responder_public)), static.public)   # es, s
+        enc_ts = st.encrypt(st.mix_key(static.dh(responder_public)), struct.pack("!Q", ts))  # ss
+    except crypto.CryptoError as e:
+        raise ProtocolError(str(e)) from None
+    packet = _INIT_HDR.pack(MSG_INIT, idx) + eph.public + enc_static + enc_ts
+    return PendingInit(idx, eph, st, packet)
 
 
-def parse_init(psk: bytes, packet: bytes, now_ns: int | None = None) -> InitInfo:
+def parse_init(static: crypto.KeyPair, packet: bytes, now_ns: int | None = None) -> InitInfo:
     if len(packet) != INIT_LEN:
         raise ProtocolError("bad init length")
-    body, mac = packet[: _INIT_BODY.size], packet[_INIT_BODY.size :]
-    if not crypto.verify_mac(crypto.mac_key(psk), body, mac):
-        raise ProtocolError("init mac mismatch")
-    _, idx, eph_pub, ts, ip = _INIT_BODY.unpack(body)
+    _, idx = _INIT_HDR.unpack_from(packet)
+    off = _INIT_HDR.size
+    eph_pub = packet[off : off + 32]
+    enc_static = packet[off + 32 : off + 32 + _ENC_STATIC_LEN]
+    enc_ts = packet[off + 32 + _ENC_STATIC_LEN :]
+    st = _Symmetric.initial(static.public)
+    try:
+        st.mix_hash(eph_pub)
+        st.mix_key(eph_pub)
+        peer_static = st.decrypt(st.mix_key(static.dh(eph_pub)), enc_static)
+        (ts,) = struct.unpack("!Q", st.decrypt(st.mix_key(static.dh(peer_static)), enc_ts))
+    except crypto.CryptoError as e:
+        raise ProtocolError(f"init rejected: {e}") from None
     now = time.time_ns() if now_ns is None else now_ns
     if abs(now - ts) > MAX_CLOCK_SKEW_NS:
         raise ProtocolError("init timestamp outside allowed skew")
-    return InitInfo(idx, eph_pub, ts, ipaddress.IPv4Address(ip), packet)
+    return InitInfo(idx, eph_pub, peer_static, ts, st)
 
 
-def respond(psk: bytes, init: InitInfo) -> tuple[bytes, Session]:
-    eph = crypto.Ephemeral()
+def respond(init: InitInfo) -> tuple[bytes, Session]:
+    st = init.state
+    eph = crypto.KeyPair.generate()
     idx = new_index()
-    body = _RESP_BODY.pack(MSG_RESPONSE, idx, init.sender_idx, eph.public)
-    packet = body + crypto.compute_mac(crypto.mac_key(psk), body + init.packet)
-    k_i2r, k_r2i = crypto.derive_keys(psk, eph.exchange(init.eph_pub), init.eph_pub, eph.public)
-    session = Session(idx, init.sender_idx, crypto.Cipher(k_r2i), crypto.Cipher(k_i2r))
-    return packet, session
+    try:
+        st.mix_hash(eph.public)
+        st.mix_key(eph.public)
+        st.mix_key(eph.dh(init.ephemeral_public))  # ee
+        key = st.mix_key(eph.dh(init.static_public))  # se
+    except crypto.CryptoError as e:
+        raise ProtocolError(str(e)) from None
+    packet = _RESP_HDR.pack(MSG_RESPONSE, idx, init.sender_idx) + eph.public + st.encrypt(key, b"")
+    k_i2r, k_r2i = st.split()
+    return packet, Session(idx, init.sender_idx, crypto.Cipher(k_r2i), crypto.Cipher(k_i2r))
 
 
-def complete(psk: bytes, pending: PendingInit, packet: bytes) -> Session:
+def complete(static: crypto.KeyPair, pending: PendingInit, packet: bytes) -> Session:
     if len(packet) != RESP_LEN:
         raise ProtocolError("bad response length")
-    body, mac = packet[: _RESP_BODY.size], packet[_RESP_BODY.size :]
-    if not crypto.verify_mac(crypto.mac_key(psk), body + pending.packet, mac):
-        raise ProtocolError("response mac mismatch")
-    _, idx, receiver_idx, eph_pub = _RESP_BODY.unpack(body)
+    _, idx, receiver_idx = _RESP_HDR.unpack_from(packet)
     if receiver_idx != pending.local_idx:
         raise ProtocolError("response for unknown handshake")
-    k_i2r, k_r2i = crypto.derive_keys(psk, pending.ephemeral.exchange(eph_pub), pending.ephemeral.public, eph_pub)
+    eph_pub = packet[_RESP_HDR.size : _RESP_HDR.size + 32]
+    # Work on a copy so a forged response can't corrupt state needed for the genuine one.
+    st = _Symmetric(pending.state.ck, pending.state.h)
+    try:
+        st.mix_hash(eph_pub)
+        st.mix_key(eph_pub)
+        st.mix_key(pending.ephemeral.dh(eph_pub))  # ee
+        st.decrypt(st.mix_key(static.dh(eph_pub)), packet[_RESP_HDR.size + 32 :])  # se
+    except crypto.CryptoError as e:
+        raise ProtocolError(f"response rejected: {e}") from None
+    k_i2r, k_r2i = st.split()
     return Session(pending.local_idx, idx, crypto.Cipher(k_i2r), crypto.Cipher(k_r2i))
 
 
