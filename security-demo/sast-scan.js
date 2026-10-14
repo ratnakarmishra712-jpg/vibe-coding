@@ -187,8 +187,10 @@ function listFiles(dir) {
 }
 
 const findings = [];
-const target = fs.statSync(root).isDirectory() ? root : path.dirname(root);
-for (const f of listFiles(target)) {
+const rootStat = fs.statSync(root);
+const target = rootStat.isDirectory() ? root : path.basename(root);
+const files = rootStat.isDirectory() ? listFiles(root) : [root];
+for (const f of files) {
   const code = fs.readFileSync(f, 'utf8');
   if (f.endsWith('.html')) extractScripts(code).forEach((s, i) => scanSource(s, `${f}#script${i + 1}`, findings));
   else scanSource(code, f, findings);
