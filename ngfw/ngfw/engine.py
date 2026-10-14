@@ -38,7 +38,9 @@ class Firewall:
                  conntrack: ConnTracker | None = None):
         self.rules = ruleset
         self.default = default
-        self.ct = conntrack or ConnTracker()
+        # Use `is None`, not `or`: ConnTracker defines __len__, so an *empty*
+        # tracker is falsy and `conntrack or ConnTracker()` would discard it.
+        self.ct = conntrack if conntrack is not None else ConnTracker()
         self.stats = {"allow": 0, "deny": 0, "reject": 0, "seen": 0}
 
     def evaluate(self, pkt: Packet) -> Verdict:
