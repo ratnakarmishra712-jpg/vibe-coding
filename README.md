@@ -18,9 +18,17 @@ It carries IPv4 packets from a Linux TUN device inside encrypted UDP datagrams.
   - The server drops packets whose inner source IP isn't the sender's assigned tunnel IP, so a client can't pose as another client.
   - Clients rekey every 10 minutes and send a keepalive every 25s. Idle sessions expire after 3 minutes.
   - Clients can roam to a new address: the server follows the last authenticated source address.
+- **Handshake-flood (DoS) protection:** this follows WireGuard's cookie mechanism (`vpn/dos.py`).
+  - **mac1:** every `INIT` carries a MAC keyed by the server's public key. Junk and packets aimed at the wrong server are dropped without any Diffie-Hellman work.
+  - **Cookies:** when the server sees more than `--load-threshold` handshakes per second (default 50), it stops doing handshakes for `INIT`s without a valid mac2. Instead it sends a small encrypted `COOKIE` reply.
+    - The cookie is a MAC of the sender's IP:port under a secret that rotates every 2 minutes.
+    - The client stores it, and its next retry carries a mac2 keyed with it. That proves it can receive packets at the address it sent from, so spoofed-source floods are filtered out.
+    - Cookie replies are smaller than `INIT`s, so they can't be used to amplify traffic.
+    - Cookie replies are bound to the `INIT`'s mac1, so off-path attackers can't inject fake ones.
+  - **Rate limit:** while under load, handshakes that do carry a valid cookie are also limited to 5/s per source IP, with bursts of up to 10.
 
 Code layout: `vpn/crypto.py` (primitives), `vpn/protocol.py` (wire format, sessions, replay window),
-`vpn/node.py` (server/client state machines, socket-free), `vpn/tun.py`, `vpn/__main__.py` (CLI + event loop).
+`vpn/dos.py` (cookies, load detection, rate limiting), `vpn/node.py` (server/client state machines, socket-free), `vpn/tun.py`, `vpn/__main__.py` (CLI + event loop).
 
 ## Usage
 
@@ -68,7 +76,7 @@ The tests run the full client/server protocol through in-memory transports, so t
 ## Limitations (it's a learning project)
 
 - **IPv4 only, one address per peer.** Peer config is static: changing it needs a server restart.
-- **No DoS protection.** The server does no handshake rate limiting and has no cookie mechanism.
-  Every `INIT` costs it two Diffie-Hellman operations.
+- **Single-threaded event loop.** The DoS defences cap the expensive work, but a large enough
+  raw packet flood can still saturate the loop. Put a firewall in front of anything exposed.
 - **Python throughput.** Speed is limited by Python itself. Don't expect line-rate performance.
 - **Unaudited.** Use WireGuard for anything real.

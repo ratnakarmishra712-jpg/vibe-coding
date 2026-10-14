@@ -2,9 +2,11 @@ import ipaddress
 import os
 import struct
 import tempfile
+import time
 import unittest
+from unittest import mock
 
-from vpn import crypto, protocol
+from vpn import crypto, dos, protocol
 from vpn.__main__ import load_peers
 from vpn.node import SESSION_TIMEOUT, Client, Server
 
@@ -27,11 +29,13 @@ def ipv4_packet(src: str, dst: str, payload: bytes = b"hello") -> bytes:
 class Network:
     """Wires a Server and any number of Clients together through an in-memory queue."""
 
-    def __init__(self):
+    def __init__(self, load_threshold=dos.DEFAULT_LOAD_THRESHOLD):
         self.wire: list[tuple[bytes, tuple, tuple]] = []  # (data, src, dst)
         self.server_tun: list[bytes] = []
+        self.now = 1000.0
         self.server = Server(SERVER_KEY, ipaddress.IPv4Interface("10.8.0.1/24"), PEERS,
-                             lambda d, a: self.wire.append((d, SERVER_ADDR, a)), self.server_tun.append)
+                             lambda d, a: self.wire.append((d, SERVER_ADDR, a)), self.server_tun.append,
+                             load_threshold=load_threshold, clock=lambda: self.now)
         self.clients: dict[tuple, Client] = {}
         self.client_tun: dict[tuple, list[bytes]] = {}
 
@@ -47,8 +51,9 @@ class Network:
         while self.wire:
             data, src, dst = self.wire.pop(0)
             delivered.append(data)
-            node = self.server if dst == SERVER_ADDR else self.clients[dst]
-            node.handle_datagram(data, src)
+            node = self.server if dst == SERVER_ADDR else self.clients.get(dst)
+            if node is not None:
+                node.handle_datagram(data, src)
         return delivered
 
     def connect(self, client):
@@ -218,6 +223,122 @@ class EndToEndTest(unittest.TestCase):
         net.server.tick(now=peer.session.last_received + SESSION_TIMEOUT + 1)
         self.assertIsNone(peer.session)
         self.assertEqual(net.server.by_index, {})
+
+
+class DosTest(unittest.TestCase):
+    ALICE_ADDR = ("198.51.100.7", 40000)
+
+    def flood(self, net, count, base="203.0.113."):
+        """Send `count` well-formed INITs (valid mac1, unknown key) from distinct addresses."""
+        for i in range(count):
+            init = protocol.create_init(MALLORY, SERVER_KEY.public).packet
+            net.server.handle_datagram(init, (base + str(i % 250 + 1), 1000 + i))
+
+    def sent_types(self, net):
+        types = [d[0] for d, src, _ in net.wire if src == SERVER_ADDR]
+        net.wire.clear()
+        return types
+
+    def test_bad_mac1_dropped_before_any_dh(self):
+        net = Network()
+        init = bytearray(protocol.create_init(ALICE, SERVER_KEY.public).packet)
+        init[protocol.INIT_BODY_LEN] ^= 1
+        with mock.patch.object(protocol, "parse_init") as parse:
+            net.server.handle_datagram(bytes(init), self.ALICE_ADDR)
+            net.server.handle_datagram(b"\x01" + os.urandom(protocol.INIT_LEN - 1), self.ALICE_ADDR)
+        parse.assert_not_called()
+        self.assertEqual(net.wire, [])
+
+    def test_no_cookie_needed_when_idle(self):
+        net = Network(load_threshold=5)
+        self.flood(net, 3)
+        self.assertNotIn(protocol.MSG_COOKIE, self.sent_types(net))
+
+    def test_under_load_replies_with_cookie_instead_of_handshake(self):
+        net = Network(load_threshold=5)
+        self.flood(net, 5)
+        with mock.patch.object(protocol, "parse_init", wraps=protocol.parse_init) as parse:
+            self.flood(net, 20, base="192.0.2.")
+        parse.assert_not_called()
+        types = self.sent_types(net)
+        self.assertEqual(types[-20:], [protocol.MSG_COOKIE] * 20)
+        self.assertLess(protocol.COOKIE_LEN, protocol.INIT_LEN)  # no amplification
+
+    def test_legit_client_connects_under_load_with_cookie(self):
+        net = Network(load_threshold=5)
+        alice = net.add_client(ALICE, self.ALICE_ADDR)
+        self.flood(net, 10)
+        net.wire.clear()
+        net.connect(alice)
+        self.assertFalse(alice.connected)
+        self.assertIsNotNone(alice.cookies.current())
+        alice.tick(now=time.monotonic() + 6)  # handshake retry timer fires
+        net.deliver()
+        self.assertTrue(alice.connected)
+
+    def test_load_subsides(self):
+        net = Network(load_threshold=5)
+        alice = net.add_client(ALICE, self.ALICE_ADDR)
+        self.flood(net, 10)
+        net.wire.clear()
+        net.now += 5
+        net.connect(alice)
+        self.assertTrue(alice.connected)
+
+    def test_cookie_bound_to_source_address(self):
+        net = Network(load_threshold=0)
+        cookie = net.server.cookies.cookie_for(self.ALICE_ADDR, net.now)
+        init = protocol.create_init(ALICE, SERVER_KEY.public, cookie=cookie).packet
+        net.server.handle_datagram(init, ("203.0.113.9", 40000))
+        self.assertEqual(self.sent_types(net), [protocol.MSG_COOKIE])
+        net.server.handle_datagram(init, self.ALICE_ADDR)
+        self.assertEqual(self.sent_types(net), [protocol.MSG_RESPONSE])
+
+    def test_cookie_expires_when_secret_rotates(self):
+        net = Network(load_threshold=0)
+        cookie = net.server.cookies.cookie_for(self.ALICE_ADDR, net.now)
+        net.now += dos.COOKIE_SECRET_LIFETIME + 1
+        init = protocol.create_init(ALICE, SERVER_KEY.public, cookie=cookie).packet
+        net.server.handle_datagram(init, self.ALICE_ADDR)
+        self.assertEqual(self.sent_types(net), [protocol.MSG_COOKIE])
+
+    def test_per_ip_rate_limit_with_valid_cookie(self):
+        net = Network(load_threshold=0)
+        addr = ("203.0.113.9", 4000)
+        cookie = net.server.cookies.cookie_for(addr, net.now)
+        with mock.patch.object(protocol, "parse_init", side_effect=protocol.ProtocolError("x")) as parse:
+            for _ in range(50):
+                net.server.handle_datagram(
+                    protocol.create_init(MALLORY, SERVER_KEY.public, cookie=cookie).packet, addr)
+        self.assertEqual(parse.call_count, int(dos.PER_IP_BURST))
+
+    def test_forged_cookie_reply_rejected(self):
+        net = Network()
+        alice = net.add_client(ALICE, self.ALICE_ADDR)
+        alice.start_handshake()
+        # An attacker who doesn't see Alice's INIT can't produce a reply bound to its mac1.
+        other = protocol.create_init(ALICE, SERVER_KEY.public).packet
+        forged = bytearray(protocol.seal_cookie(protocol.cookie_key(SERVER_KEY.public), other, os.urandom(16)))
+        forged[1:5] = struct.pack("!I", alice.pending.local_idx)
+        alice.handle_datagram(bytes(forged), SERVER_ADDR)
+        self.assertIsNone(alice.cookies.current())
+
+    def test_client_cookie_expires(self):
+        clock = [0.0]
+        jar = dos.CookieJar(clock=lambda: clock[0])
+        jar.store(b"c" * 16)
+        self.assertEqual(jar.current(), b"c" * 16)
+        clock[0] += dos.COOKIE_LIFETIME
+        self.assertIsNone(jar.current())
+
+    def test_rate_limiter_refills_and_prunes(self):
+        rl = dos.RateLimiter(rate=1.0, burst=2.0)
+        self.assertTrue(rl.allow("a", 0.0))
+        self.assertTrue(rl.allow("a", 0.0))
+        self.assertFalse(rl.allow("a", 0.0))
+        self.assertTrue(rl.allow("a", 1.0))
+        rl.prune(10.0)
+        self.assertEqual(rl._buckets, {})
 
 
 class ConfigTest(unittest.TestCase):

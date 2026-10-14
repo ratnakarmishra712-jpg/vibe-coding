@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-from . import crypto, protocol
+from . import crypto, dos, protocol
 from .protocol import ProtocolError
 
 log = logging.getLogger(__name__)
@@ -38,8 +38,13 @@ class _ServerPeer:
 
 class Server:
     def __init__(self, static: crypto.KeyPair, interface: ipaddress.IPv4Interface,
-                 peers: dict[bytes, ipaddress.IPv4Address], send: SendFn, tun_write: TunWriteFn) -> None:
+                 peers: dict[bytes, ipaddress.IPv4Address], send: SendFn, tun_write: TunWriteFn,
+                 load_threshold: int = dos.DEFAULT_LOAD_THRESHOLD, clock: dos.Clock = time.monotonic) -> None:
         self.static = static
+        self.clock = clock
+        self.cookies = dos.CookieChecker(static.public)
+        self.load = dos.LoadMonitor(load_threshold)
+        self.limiter = dos.RateLimiter()
         self.interface = interface
         self.send = send
         self.tun_write = tun_write
@@ -67,6 +72,16 @@ class Server:
             log.debug("dropping datagram from %s: %s", addr, e)
 
     def _handle_init(self, data: bytes, addr: Addr) -> None:
+        # Everything up to parse_init is cheap; parse_init does two DH operations.
+        if not self.cookies.check_mac1(data):
+            raise ProtocolError("bad mac1")
+        now = self.clock()
+        if self.load.record(now):
+            if not self.cookies.check_mac2(data, addr, now):
+                self.send(self.cookies.reply(data, addr, now), addr)
+                return
+            if not self.limiter.allow(addr[0], now):
+                raise ProtocolError("handshake rate limit exceeded")
         init = protocol.parse_init(self.static, data)
         peer = self.peers.get(init.static_public)
         if peer is None:
@@ -100,7 +115,8 @@ class Server:
         self.send(peer.session.seal(packet), peer.addr)
 
     def tick(self, now: float | None = None) -> None:
-        now = time.monotonic() if now is None else now
+        now = self.clock() if now is None else now
+        self.limiter.prune(now)
         for peer in self.peers.values():
             if peer.session is not None and now - peer.session.last_received > SESSION_TIMEOUT:
                 log.info("peer %s timed out", peer.tunnel_ip)
@@ -118,6 +134,7 @@ class Client:
         self.static = static
         self.server_public = server_public
         self.server = server
+        self.cookies = dos.CookieJar()
         self.send = send
         self.tun_write = tun_write
         self.session: protocol.Session | None = None
@@ -132,7 +149,7 @@ class Client:
         return self.session is not None
 
     def start_handshake(self, now: float | None = None) -> None:
-        self.pending = protocol.create_init(self.static, self.server_public)
+        self.pending = protocol.create_init(self.static, self.server_public, cookie=self.cookies.current())
         self.last_init_sent = time.monotonic() if now is None else now
         self.send(self.pending.packet, self.server)
 
@@ -145,6 +162,8 @@ class Client:
                 self._handle_response(data)
             elif kind == protocol.MSG_DATA:
                 self._handle_data(data)
+            elif kind == protocol.MSG_COOKIE:
+                self._handle_cookie(data)
             else:
                 raise ProtocolError(f"unexpected message type {kind}")
         except ProtocolError as e:
@@ -160,6 +179,14 @@ class Client:
         log.info("handshake complete with %s:%d", *self.server)
         # Confirm the session right away so the server sees traffic on it.
         self.send(session.seal(b""), self.server)
+
+    def _handle_cookie(self, data: bytes) -> None:
+        if self.pending is None:
+            raise ProtocolError("no handshake in progress")
+        self.cookies.store(protocol.open_cookie(self.server_public, self.pending, data))
+        # Like WireGuard, wait for the normal retry timer rather than resending at once,
+        # so a busy server isn't hit with an immediate burst of retries.
+        log.info("server is under load; got a cookie, will retry handshake")
 
     def _handle_data(self, data: bytes) -> None:
         idx = protocol.data_receiver_index(data)

@@ -3,36 +3,55 @@
 Messages (all integers big-endian unless noted):
 
   INIT     type=1 | sender_idx(4) | eph_pub(32) | enc(static_pub)(32+16) | enc(timestamp_ns)(8+16)
+           | mac1(16) | mac2(16)
   RESPONSE type=2 | sender_idx(4) | receiver_idx(4) | eph_pub(32) | enc(empty)(16)
   DATA     type=3 | receiver_idx(4) | counter(8) | ciphertext+tag
+  COOKIE   type=4 | receiver_idx(4) | nonce(12) | enc(cookie)(16+16)
 
 The handshake follows the Noise IK pattern (`-> e, es, s, ss` / `<- e, ee, se`):
 the initiator's static key travels encrypted, every encryption is bound to the
 running transcript hash, and only the holders of the expected static private
 keys can derive the session keys. DATA headers are authenticated as AEAD
 associated data. An empty DATA payload is a keepalive.
+
+mac1/mac2 are the WireGuard-style DoS defence (see `vpn.dos`): mac1 is keyed by
+the responder's public key and lets it discard junk without doing any DH; mac2
+is keyed by a cookie the responder hands out when under load, proving the
+sender can receive traffic at its claimed source address.
 """
 
+import hashlib
+
+import hmac
 import ipaddress
 import os
 import struct
 import time
 from dataclasses import dataclass, field
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
 from . import crypto
 
 MSG_INIT = 1
 MSG_RESPONSE = 2
 MSG_DATA = 3
+MSG_COOKIE = 4
 
 _INIT_HDR = struct.Struct("!BI")
 _RESP_HDR = struct.Struct("!BII")
 _DATA_HDR = struct.Struct("!BIQ")
 _ENC_STATIC_LEN = crypto.KEY_LEN + crypto.TAG_LEN
 _ENC_TS_LEN = 8 + crypto.TAG_LEN
+_COOKIE_HDR = struct.Struct("!BI")
+MAC_LEN = 16
+COOKIE_NONCE_LEN = 12
 
 CONSTRUCTION = b"vibe-vpn v2 Noise_IK_25519_ChaChaPoly_SHA256"
-INIT_LEN = _INIT_HDR.size + crypto.KEY_LEN + _ENC_STATIC_LEN + _ENC_TS_LEN
+INIT_BODY_LEN = _INIT_HDR.size + crypto.KEY_LEN + _ENC_STATIC_LEN + _ENC_TS_LEN
+INIT_LEN = INIT_BODY_LEN + 2 * MAC_LEN
+COOKIE_LEN = _COOKIE_HDR.size + COOKIE_NONCE_LEN + MAC_LEN + crypto.TAG_LEN
 RESP_LEN = _RESP_HDR.size + crypto.KEY_LEN + crypto.TAG_LEN
 DATA_HDR_LEN = _DATA_HDR.size
 
@@ -182,7 +201,8 @@ class InitInfo:
     state: _Symmetric
 
 
-def create_init(static: crypto.KeyPair, responder_public: bytes, now_ns: int | None = None) -> PendingInit:
+def create_init(static: crypto.KeyPair, responder_public: bytes, now_ns: int | None = None,
+                cookie: bytes | None = None) -> PendingInit:
     st = _Symmetric.initial(responder_public)
     eph = crypto.KeyPair.generate()
     idx = new_index()
@@ -194,8 +214,10 @@ def create_init(static: crypto.KeyPair, responder_public: bytes, now_ns: int | N
         enc_ts = st.encrypt(st.mix_key(static.dh(responder_public)), struct.pack("!Q", ts))  # ss
     except crypto.CryptoError as e:
         raise ProtocolError(str(e)) from None
-    packet = _INIT_HDR.pack(MSG_INIT, idx) + eph.public + enc_static + enc_ts
-    return PendingInit(idx, eph, st, packet)
+    body = _INIT_HDR.pack(MSG_INIT, idx) + eph.public + enc_static + enc_ts
+    m1 = mac(mac1_key(responder_public), body)
+    m2 = mac(cookie, body + m1) if cookie else bytes(MAC_LEN)
+    return PendingInit(idx, eph, st, body + m1 + m2)
 
 
 def parse_init(static: crypto.KeyPair, packet: bytes, now_ns: int | None = None) -> InitInfo:
@@ -205,7 +227,7 @@ def parse_init(static: crypto.KeyPair, packet: bytes, now_ns: int | None = None)
     off = _INIT_HDR.size
     eph_pub = packet[off : off + 32]
     enc_static = packet[off + 32 : off + 32 + _ENC_STATIC_LEN]
-    enc_ts = packet[off + 32 + _ENC_STATIC_LEN :]
+    enc_ts = packet[off + 32 + _ENC_STATIC_LEN : INIT_BODY_LEN]
     st = _Symmetric.initial(static.public)
     try:
         st.mix_hash(eph_pub)
@@ -254,6 +276,61 @@ def complete(static: crypto.KeyPair, pending: PendingInit, packet: bytes) -> Ses
         raise ProtocolError(f"response rejected: {e}") from None
     k_i2r, k_r2i = st.split()
     return Session(pending.local_idx, idx, crypto.Cipher(k_i2r), crypto.Cipher(k_r2i))
+
+
+# --- mac1 / mac2 / cookie replies ------------------------------------------
+
+
+def mac(key: bytes, data: bytes) -> bytes:
+    return hashlib.blake2s(data, key=key, digest_size=MAC_LEN).digest()
+
+
+def mac1_key(responder_public: bytes) -> bytes:
+    return crypto.hash_(b"mac1----", responder_public)
+
+
+def cookie_key(responder_public: bytes) -> bytes:
+    return crypto.hash_(b"cookie--", responder_public)
+
+
+def init_sender_index(packet: bytes) -> int:
+    return _INIT_HDR.unpack_from(packet)[1]
+
+
+def init_mac1(packet: bytes) -> bytes:
+    return packet[INIT_BODY_LEN : INIT_BODY_LEN + MAC_LEN]
+
+
+def verify_mac1(key: bytes, packet: bytes) -> bool:
+    if len(packet) != INIT_LEN:
+        return False
+    return hmac.compare_digest(mac(key, packet[:INIT_BODY_LEN]), init_mac1(packet))
+
+
+def verify_mac2(cookie: bytes, packet: bytes) -> bool:
+    end = INIT_BODY_LEN + MAC_LEN
+    return hmac.compare_digest(mac(cookie, packet[:end]), packet[end:])
+
+
+def seal_cookie(key: bytes, init_packet: bytes, cookie: bytes) -> bytes:
+    """Encrypt `cookie` for the sender of `init_packet`, bound to that packet's mac1."""
+    nonce = os.urandom(COOKIE_NONCE_LEN)
+    header = _COOKIE_HDR.pack(MSG_COOKIE, init_sender_index(init_packet))
+    return header + nonce + ChaCha20Poly1305(key).encrypt(nonce, cookie, init_mac1(init_packet))
+
+
+def open_cookie(responder_public: bytes, pending: PendingInit, packet: bytes) -> bytes:
+    if len(packet) != COOKIE_LEN:
+        raise ProtocolError("bad cookie reply length")
+    _, receiver_idx = _COOKIE_HDR.unpack_from(packet)
+    if receiver_idx != pending.local_idx:
+        raise ProtocolError("cookie reply for unknown handshake")
+    nonce = packet[_COOKIE_HDR.size : _COOKIE_HDR.size + COOKIE_NONCE_LEN]
+    try:
+        return ChaCha20Poly1305(cookie_key(responder_public)).decrypt(
+            nonce, packet[_COOKIE_HDR.size + COOKIE_NONCE_LEN :], init_mac1(pending.packet))
+    except InvalidTag:
+        raise ProtocolError("cookie reply authentication failed") from None
 
 
 def ipv4_source(packet: bytes) -> ipaddress.IPv4Address | None:

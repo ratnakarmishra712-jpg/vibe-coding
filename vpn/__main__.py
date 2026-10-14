@@ -7,7 +7,7 @@ import selectors
 import socket
 import sys
 
-from . import crypto
+from . import crypto, dos
 from .node import Client, Server
 from .tun import Tun
 
@@ -85,7 +85,8 @@ def cmd_server(args: argparse.Namespace) -> None:
     sock.bind((host, port))
     tun = Tun(args.dev)
     tun.configure(str(iface), args.mtu)
-    server = Server(static, iface, peers, lambda d, a: sock.sendto(d, a), tun.write)
+    server = Server(static, iface, peers, lambda d, a: sock.sendto(d, a), tun.write,
+                    load_threshold=args.load_threshold)
     logging.info("listening on %s:%d, tunnel %s on %s, %d peer(s), public key %s",
                  host, port, iface, tun.name, len(peers), crypto.encode_key(static.public))
     _run(server, sock, tun)
@@ -130,6 +131,9 @@ def main(argv: list[str] | None = None) -> None:
             sp.add_argument("--peers-file", help="file of '<public-key> <tunnel-ip>' lines")
             sp.add_argument("--peer", action="append", default=[], metavar="KEY=IP",
                             help="allow a client public key with the given tunnel IP (repeatable)")
+            sp.add_argument("--load-threshold", type=int, default=dos.DEFAULT_LOAD_THRESHOLD, metavar="N",
+                            help="handshakes per second before requiring cookies "
+                                 f"(default {dos.DEFAULT_LOAD_THRESHOLD})")
         else:
             sp.add_argument(endpoint_flag, required=True, help=endpoint_help)
             sp.add_argument("--server-public-key", required=True, help="the server's public key")
