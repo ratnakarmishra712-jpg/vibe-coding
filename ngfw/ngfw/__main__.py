@@ -39,6 +39,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="ngfw", description="learning stateful firewall")
     ap.add_argument("--rules", default=_DEFAULT_RULES, help="policy file (default: rules.example.conf)")
     ap.add_argument("--demo", action="store_true", help="run the built-in scenario (default action)")
+    ap.add_argument("--pcap", metavar="FILE", help="read real packets from a .pcap capture instead of the simulator")
+    ap.add_argument("--home", default="10.0.0.5/32",
+                    help="your IP/CIDR(s), comma-separated: packets FROM here are outbound (pcap only)")
     args = ap.parse_args(argv)
 
     try:
@@ -48,9 +51,20 @@ def main(argv=None) -> int:
         return 2
 
     fw = Firewall(ruleset, default=Action.DENY)
-    backend = SimulatedBackend(fw)
+    if args.pcap:
+        from .backends.pcap import PcapBackend  # lazy: only needs scapy when used
+        try:
+            backend = PcapBackend(fw, args.pcap, home=args.home)
+        except (RuntimeError, OSError) as e:
+            print(f"error opening pcap: {e}", file=sys.stderr)
+            return 2
+        source = f"pcap: {args.pcap}  (home={args.home})"
+    else:
+        backend = SimulatedBackend(fw)
+        source = "simulated scenario"
 
-    print(f"{DIM}policy: {args.rules}  ({len(ruleset.rules)} rules, default={fw.default.value}){RESET}\n")
+    print(f"{DIM}policy: {args.rules}  ({len(ruleset.rules)} rules, default={fw.default.value})"
+          f"\nsource: {source}{RESET}\n")
     backend.run(on_verdict=_print_verdict)
 
     s = fw.stats

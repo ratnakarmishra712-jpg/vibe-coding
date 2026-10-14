@@ -1,0 +1,2 @@
+# Stage 2 (pcap backend) needs scapy. Stage 1 has no dependencies.
+scapy>=2.5.0

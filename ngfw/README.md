@@ -27,8 +27,18 @@ logic in the safe simulator now; switch to real traffic later without a rewrite.
 cd ngfw
 python3 -m ngfw --demo                 # built-in scenario (no deps, no root)
 python3 -m ngfw --rules rules.example.conf
-python3 -m unittest discover -s tests  # 6 tests
+python3 -m unittest discover -s tests  # the test suite
+
+# Stage 2: feed REAL captured packets through the same engine (needs scapy)
+pip install -r requirements.txt
+python3 make_sample_pcap.py            # writes sample.pcap
+python3 -m ngfw --pcap sample.pcap --home 10.0.0.5/32
 ```
+
+`--home` tells the pcap backend which address(es) are *yours*: packets from
+there are outbound, everything else inbound (a capture file has no built-in
+direction). Point `--pcap` at any `.pcap`/`.pcapng` you captured with
+`tcpdump`/Wireshark to audit real traffic against your policy.
 
 Each line of output shows: the **verdict**, the **connection state** conntrack
 assigned (`new` / `established` / `invalid`), the packet, and **which rule
@@ -44,6 +54,8 @@ decided it** — so you can watch the firewall think.
 | `ngfw/engine.py` | The decision loop: conntrack → rules → verdict, with **default-deny**. |
 | `ngfw/backends/base.py` | The backend interface (the swappable plumbing). |
 | `ngfw/backends/simulated.py` | A scripted, safe data plane to experiment in. |
+| `ngfw/backends/pcap.py` | **Stage 2:** reads real packets from a capture via scapy and converts them to our `Packet`. |
+| `make_sample_pcap.py` | Generates `sample.pcap` so the pcap backend runs out of the box. |
 | `rules.example.conf` | A commented starter policy. Edit it and re-run. |
 | `tests/` | Behaviour locked in so you can refactor fearlessly. |
 
@@ -70,8 +82,9 @@ Each stage adds a layer *on top of* the same engine. We'll do them one at a time
 
 - [x] **Stage 1 — Stateful L3/L4 core** (this): 5-tuple rules, conntrack (TCP
       state machine + UDP/ICMP), default-deny, logging, tests.
-- [ ] **Stage 2 — Real packets (pcap backend):** read a `.pcap` or live-sniff
-      with `scapy`, feed the *same* engine. Still no enforcement, but real data.
+- [x] **Stage 2 — Real packets (pcap backend):** read a `.pcap` with `scapy`,
+      convert to our `Packet`, feed the *same* engine. Real data, still
+      observe-only. (Live sniff is a small add-on; it needs root.)
 - [ ] **Stage 3 — Inline enforcement (NFQUEUE backend):** on Linux, actually
       drop/allow live packets via netfilter. First "real" firewall.
 - [ ] **Stage 4 — Layer 7 app-ID & DPI:** identify HTTP, TLS (SNI), DNS; match
