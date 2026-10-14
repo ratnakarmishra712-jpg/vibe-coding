@@ -26,6 +26,7 @@ DIM = "\033[2m" if _C else ""
 RESET = "\033[0m" if _C else ""
 
 _DEFAULT_RULES = os.path.join(os.path.dirname(__file__), os.pardir, "rules.example.conf")
+_DEFAULT_SIGS = os.path.join(os.path.dirname(__file__), os.pardir, "signatures.example.rules")
 
 
 def _print_verdict(pkt, verdict) -> None:
@@ -36,6 +37,8 @@ def _print_verdict(pkt, verdict) -> None:
     if pkt.meta.get("host"):
         l7 = f"  {YELLOW}{pkt.meta.get('app', 'app')}:{pkt.meta['host']}{RESET}"
     print(f"{tag} {state} {pkt}{l7}   {DIM}# {verdict.reason}{RESET}")
+    for a in verdict.alerts:
+        print(f"       {RED}⚠ IDS {a}{RESET}")
 
 
 def main(argv=None) -> int:
@@ -49,6 +52,10 @@ def main(argv=None) -> int:
                     help="with --nfqueue: actually DROP denied packets (default: observe only, drop nothing)")
     ap.add_argument("--home", default="10.0.0.5/32",
                     help="your IP/CIDR(s), comma-separated: packets FROM here are outbound (pcap/nfqueue)")
+    ap.add_argument("--signatures", default=_DEFAULT_SIGS, help="IDS signature file")
+    ap.add_argument("--no-ids", dest="ids", action="store_false", help="disable the IDS/IPS entirely")
+    ap.add_argument("--ips", action="store_true",
+                    help="IPS mode: a 'drop' alert overrides an allow (default: IDS alert-only)")
     args = ap.parse_args(argv)
 
     try:
@@ -57,7 +64,16 @@ def main(argv=None) -> int:
         print(f"error loading rules: {e}", file=sys.stderr)
         return 2
 
-    fw = Firewall(ruleset, default=Action.DENY)
+    ids = None
+    if args.ids:
+        from .ids import IDS, load_signatures
+        try:
+            ids = IDS(load_signatures(args.signatures))
+        except (OSError, ValueError) as e:
+            print(f"error loading signatures: {e}", file=sys.stderr)
+            return 2
+
+    fw = Firewall(ruleset, default=Action.DENY, ids=ids, ips=args.ips)
     if args.nfqueue is not None:
         from .backends.nfqueue import NfqueueBackend  # lazy: needs netfilterqueue
         try:
@@ -82,8 +98,13 @@ def main(argv=None) -> int:
         backend = SimulatedBackend(fw)
         source = "simulated scenario"
 
+    if ids is None:
+        ids_status = "off"
+    else:
+        ids_status = f"{len(ids.signatures)} sigs + anomaly, {'IPS (drops)' if args.ips else 'IDS (alert-only)'}"
     print(f"{DIM}policy: {args.rules}  ({len(ruleset.rules)} rules, default={fw.default.value})"
-          f"\nsource: {source}{RESET}\n")
+          f"\nsource: {source}"
+          f"\nids:    {ids_status}{RESET}\n")
     try:
         backend.run(on_verdict=_print_verdict)
     except RuntimeError as e:
@@ -95,6 +116,8 @@ def main(argv=None) -> int:
     print(f"packets: {s['seen']}   {GREEN}allow:{s['allow']}{RESET}   "
           f"{RED}deny:{s['deny']}{RESET}   {YELLOW}reject:{s['reject']}{RESET}   "
           f"tracked flows: {len(fw.ct)}")
+    if args.ids:
+        print(f"IDS alerts: {s['alerts']}   IPS drops: {s['ips_drops']}")
     return 0
 
 

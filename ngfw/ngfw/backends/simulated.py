@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from ..l7 import build_client_hello, build_dns_query
+from ..l7 import build_client_hello, build_dns_query, build_http_get
 from ..packet import Direction, Packet, Proto, TcpFlags
 from .base import Backend
 
@@ -73,6 +73,21 @@ def default_scenario() -> list[Packet]:
         # 10) A DNS lookup for the tracker is blocked too (host rule on udp/53).
         Packet(Direction.OUT, Proto.UDP, me, dns, 40001, 53, length=60,
                payload=build_dns_query("ads.doubleclick.net")),
+
+        # --- Intrusion detection/prevention (Stage 5) -------------------------
+        # 11) Inbound HTTP probing for a local-file-include. Firewall denies :80
+        #     anyway, and the IDS SIGNATURE also flags the attack.
+        Packet(Direction.IN, Proto.TCP, attacker, me, 52000, 80, PSH, 200,
+               payload=build_http_get(me, "/../../etc/passwd")),
+        # 12) Data on the ESTABLISHED web flow carrying an x86 NOP sled. Policy
+        #     allows it (established), but in IPS mode the signature DROPS it —
+        #     catching malware inside otherwise-permitted traffic.
+        Packet(Direction.IN, Proto.TCP, web, me, 443, 50001, PSH, 120,
+               payload=b"\x90" * 8 + b"shellcode-demo"),
+        # 13-18) A port scan: the attacker SYNs many distinct ports fast. Each is
+        #     denied by policy, but the ANOMALY detector recognises the *pattern*.
+        *[Packet(Direction.IN, Proto.TCP, attacker, me, 53000 + p, p, SYN, 60)
+          for p in (135, 139, 445, 3389, 5900, 8080)],
     ]
 
 

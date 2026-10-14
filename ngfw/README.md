@@ -40,6 +40,14 @@ there are outbound, everything else inbound (a capture file has no built-in
 direction). Point `--pcap` at any `.pcap`/`.pcapng` you captured with
 `tcpdump`/Wireshark to audit real traffic against your policy.
 
+The **IDS is on by default** (alert-only). Compare it with prevention mode:
+
+```bash
+python3 -m ngfw --demo            # IDS: flags the NOP-sled / LFI / port-scan, drops nothing extra
+python3 -m ngfw --demo --ips      # IPS: the NOP-sled on an ALLOWED flow is now DROPPED
+python3 -m ngfw --demo --no-ids   # pure firewall, intrusion detection off
+```
+
 ### Stage 3 — live enforcement (Linux, root)
 
 This actually drops/allows real packets. **Do this on a throwaway VM, not a box
@@ -75,6 +83,8 @@ decided it** — so you can watch the firewall think.
 | `ngfw/conntrack.py` | **Connection tracking** — the difference between a dumb ACL and a *stateful* firewall. |
 | `ngfw/engine.py` | The decision loop: conntrack → rules → verdict, with **default-deny**. |
 | `ngfw/l7.py` | **Stage 4:** app-ID — parses TLS SNI / HTTP Host / DNS names from payloads (defensively), plus builders for realistic test bytes. |
+| `ngfw/ids.py` | **Stage 5:** IDS/IPS — signature engine (content/regex) + port-scan & SYN-flood anomaly detectors. |
+| `signatures.example.rules` | Example Snort/Suricata-lite signatures. |
 | `ngfw/backends/base.py` | The backend interface (the swappable plumbing). |
 | `ngfw/backends/simulated.py` | A scripted, safe data plane to experiment in. |
 | `ngfw/backends/pcap.py` | **Stage 2:** reads real packets from a capture via scapy and converts them to our `Packet`. |
@@ -104,6 +114,10 @@ demo, watch the DNS reply and the TCP handshake replies come back in as
    the allow-out rule, then watch the demo block the `example.com` TLS flow by its
    SNI while leaving other 443 traffic alone. Change the port to see that app-ID,
    not the port, is doing the work.
+6. **IDS/IPS (Stage 5):** add a signature to `signatures.example.rules`, e.g.
+   `alert tcp any content:"secret-token" msg:"leak" sid:1234`, and send a packet
+   whose payload contains it. Then run with `--ips` and change a signature's
+   action to `drop` to watch detection become prevention.
 
 ## Roadmap — how this grows into a NGFW
 
@@ -121,8 +135,9 @@ Each stage adds a layer *on top of* the same engine. We'll do them one at a time
       payloads; remember the host on the flow (conntrack); match rules on an
       optional 8th `host` field (exact or `*.suffix`). Block `*.doubleclick.net`
       on port 443 while allowing other 443 traffic.
-- [ ] **Stage 5 — IDS/IPS:** signature engine (Suricata-style rules) + simple
-      anomaly checks (port-scan, SYN-flood detection).
+- [x] **Stage 5 — IDS/IPS:** a signature engine (Snort/Suricata-lite content &
+      regex rules) + anomaly detectors (port-scan, SYN-flood). IDS alerts;
+      `--ips` turns 'drop' alerts into real denies — even on policy-allowed flows.
 - [ ] **Stage 6 — NGFW extras:** TLS/SNI policy, GeoIP, logging to JSON/syslog,
       a config/reload story, and a Go port of the hot path for throughput.
 

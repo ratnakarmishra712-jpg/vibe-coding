@@ -1,0 +1,18 @@
+# Example IDS/IPS signatures for ngfw (Snort/Suricata-lite).
+# Format:  <action> <proto> <dport>  content:"..."|regex:"..."  msg:"..." sid:N  [nocase]
+#   action : alert (log only) | drop (deny when running in IPS mode)
+#   proto  : tcp | udp | icmp | any
+#   dport  : destination port, or 'any'
+#   match  : content:"literal"  (supports \xHH escapes)  OR  regex:"pcre"
+#   These match the packet PAYLOAD (the L7 bytes), not headers.
+
+# Web attack probes against our services (detection patterns, not exploits):
+alert tcp 80  content:"../../etc/passwd"        msg:"LFI /etc/passwd probe" sid:1001
+alert tcp any regex:"(?i)union\s+select"        msg:"SQLi UNION SELECT"     sid:1002
+alert tcp any regex:"(?i)<script>"              msg:"XSS <script> tag"      sid:1003
+
+# Memory-corruption shellcode hallmark: a run of x86 NOPs. Drop it under IPS.
+drop  tcp any content:"\x90\x90\x90\x90\x90\x90\x90\x90" msg:"x86 NOP sled" sid:2001
+
+# A benign marker so you can reliably trigger an alert in the demo/tests.
+alert any any content:"NGFW-IDS-TEST"           msg:"demo signature hit"    sid:1000
