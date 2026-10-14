@@ -1,54 +1,92 @@
-# Frontend Backdoor — Detection Demo Kit
+# Backdoor Detection Demo Kit
 
-A **defensive** teaching demo for the scenario: *"Someone hands me a frontend-only
-app. How do I tell whether it secretly captures credentials and phones home?"*
+A **defensive** teaching kit for one question every pentester and blue-teamer
+eventually asks:
 
-Everything in this kit is **inert**:
+> *"Someone handed me an app. How do I tell whether it secretly captures
+> credentials and phones home — and how would an antivirus see it?"*
 
-- No real or fake credentials are ever captured.
-- No `input`/`keydown`/`submit` listeners read password or token fields.
-- No `fetch` / `XMLHttpRequest` / `sendBeacon` / WebSocket sends data anywhere.
-- The only "suspicious" content is **marker strings** in `sample-app/`, placed
-  so you can watch the scanner light them up.
+It answers that for both shapes of the threat:
 
-This kit teaches you to *find* a credential-harvesting backdoor, not to build one.
+- **Web / frontend** (JavaScript in the browser) — the main focus, with two
+  working scanners and a set of rogue test vectors.
+- **Native / desktop** (a compiled binary, e.g. Python → `.exe`) — covered in
+  the indicators and telemetry guides, since traditional antivirus sees this
+  case very differently from the web one.
+
+> **Everything here is inert and defensive.** No file captures real credentials,
+> hooks password fields, logs keystrokes, or talks to a real command-and-control
+> server. The "rogue" samples reproduce the *shape* of an exfiltration backdoor
+> using benign payloads and reserved `*.example` placeholder hosts — the same
+> idea as an EICAR test file: detectable on purpose, harmless in fact. The kit
+> teaches you to **find** a backdoor, not to build one.
+
+---
 
 ## Contents
 
-| File | Purpose |
-|------|---------|
-| `sample-app/index.html` | A benign demo page with a login form. Inert. |
-| `sample-app/app.js` | Benign app logic. Contains commented **marker strings** a scanner should flag — but no working exfiltration. |
-| `scan.sh` | Grep-based indicator scanner. Fast, zero-dependency — but matches text, so it false-positives on comments/strings. |
-| `sast-scan.js` | **AST-based taint scanner.** Parses the real code and tracks data flow from SOURCES (reading secrets) to SINKS (network calls). Flags source→sink flows and external destinations. Needs `npm install`. |
-| `test-fixtures/beacon.js` | A benign-but-flaggable fixture (an analytics beacon — *not* a stealer) to exercise the taint engine. |
-| `indicators.md` | The checklist of what the scanners look for and why each pattern matters. |
-| `csp-and-sri.md` | Countermeasure: Content-Security-Policy + Subresource Integrity configs that block a frontend from exfiltrating to unapproved origins. |
-| `telemetry-and-reports.md` | How to read CSP violation reports and AV/EDR telemetry during a live engagement. |
+| Path | What it is |
+|------|------------|
+| **`SETUP.md`** | Step-by-step install & first run. Start here. |
+| `scan.sh` | **Grep scanner** — fast, zero-dependency keyword matcher. Good first pass; false-positives on comments/strings and goes blind on obfuscation. |
+| `sast-scan.js` | **AST taint scanner** — parses the real code and tracks data flow from secret *sources* to network *sinks*. Catches obfuscated exfiltration grep misses. Needs Node + `npm install`. |
+| `indicators.md` | The checklist both scanners encode: what each pattern is and why it matters (web **and** native). |
+| `csp-and-sri.md` | The countermeasure — Content-Security-Policy + Subresource Integrity configs that *block* a frontend from exfiltrating. |
+| `telemetry-and-reports.md` | Reading CSP violation reports and AV/EDR telemetry during a live engagement. |
+| `sample-app/` | A benign demo login app whose "suspicious" lines live in **comments** — used to show grep's false positives vs. the AST's precision. |
+| `test-fixtures/beacon.js` | A benign-but-flaggable analytics beacon that exercises the taint engine. |
+| `test-fixtures/rogue-samples/` | Inert detector test vectors — one per sink (WebSocket, pixel-beacon, obfuscated `fetch`) plus a clean control that must score zero. |
 
-## grep vs. AST — the lesson
+---
 
-Run both against `sample-app/` (whose "suspicious" markers live in **comments**):
+## The two ideas the kit is built to teach
 
-- `scan.sh sample-app` → flags **6** patterns (all false positives — text in comments).
-- `node sast-scan.js sample-app` → **0** findings (the AST doesn't see comments; it reasons about executable code and real data flow).
+**1. Flow beats keywords.** A secret-*source* (reading a password field,
+`localStorage`, `document.cookie`) and a network *sink* (`fetch`, `sendBeacon`,
+`WebSocket`, a pixel `Image().src`) are each perfectly innocent on their own. A
+backdoor is the **path between them**. Grep can spot the words; only data-flow
+(taint) analysis spots the path — which is why obfuscation defeats one and not
+the other.
 
-Then run the AST scanner against the fixture to see it catch genuine flows, and
-watch the allowlist downgrade HIGH→MED instead of silencing:
+**2. The detector flags the shape; the analyst judges the sensitivity.** The AST
+scanner reacts to *source → sink → external host*, not to whether the data is
+literally a password. A leaking shopping cart and a leaking credential produce
+the same HIGH finding. The tool narrows thousands of lines to a handful of
+candidate flows; a human confirms what's actually sensitive.
 
-```bash
-npm install                                   # acorn + acorn-walk
-node sast-scan.js test-fixtures               # 2 HIGH: tainted data -> external host
-node sast-scan.js test-fixtures --allow analytics.example   # downgraded to MED
-```
+---
 
-## Run the demo
+## 60-second tour
 
 ```bash
 cd security-demo
-./scan.sh sample-app
+npm install                       # acorn + acorn-walk (for the AST scanner)
+
+# A) grep vs AST on the same benign file (markers live in COMMENTS)
+./scan.sh sample-app              # 6 FLAGS — all false positives (text in comments)
+node sast-scan.js sample-app      # 0 findings — AST ignores comments, reasons about code
+
+# B) watch the AST scanner catch real exfiltration flows
+node sast-scan.js test-fixtures/rogue-samples
+#   HIGH  pixel-beacon  (feedback .value -> Image().src)
+#   HIGH  obfuscated fetch to external host (minified var name, still traced)
+#   MED+LOW  WebSocket send + external socket
+#   (04_clean_control.js -> no findings)
+
+# C) allowlist a known first-party host: HIGH downgrades to MED, not silenced
+node sast-scan.js test-fixtures/beacon.js                          # 2 HIGH
+node sast-scan.js test-fixtures/beacon.js --allow analytics.example  # -> 0 HIGH (now MED)
 ```
 
-You should see the scanner flag the marker lines in `sample-app/app.js` with an
-explanation for each. Then read `indicators.md` and `csp-and-sri.md` to see how a
-reviewer reasons about the hits and how CSP/SRI would have stopped a real implant.
+`sast-scan.js` exits non-zero when it finds a HIGH, so it drops straight into CI.
+
+See **`SETUP.md`** for prerequisites, troubleshooting, and how to point the
+scanners at a real app you've been handed.
+
+---
+
+## Scope & ethics
+
+Built for authorized work: auditing an app before you trust it, security
+training, and CI gating. It is detection and defense only. Use it on code you
+own or are authorized to assess.
