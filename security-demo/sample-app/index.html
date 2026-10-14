@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DualLink (demo)</title>
+  <!--
+    DEMO NOTE: This is a benign sample page used only to demonstrate how a
+    security reviewer audits a shared frontend app. It does nothing with the
+    values typed into the form except show a local confirmation message.
+  -->
+</head>
+<body>
+  <main>
+    <h1>DualLink — demo login</h1>
+    <form id="login" autocomplete="off">
+      <label>Email <input type="email" name="email" /></label>
+      <label>Password <input type="password" name="password" /></label>
+      <button type="submit">Sign in</button>
+    </form>
+    <p id="status" role="status"></p>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
