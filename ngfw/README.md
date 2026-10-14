@@ -1,0 +1,87 @@
+# ngfw — a from-scratch stateful firewall (built for learning)
+
+A tiny, readable firewall you can **run, read, and modify today**, designed to
+grow — layer by layer — toward a Next-Generation Firewall (NGFW). It's built so a
+beginner can learn the real concepts safely, with no root and no risk to your
+network.
+
+```
+                 ┌─────────────────────────────────────────┐
+  packets  ─────▶│  BACKEND (plumbing)                       │
+  from...        │   simulated │ pcap │ nfqueue (later)       │
+                 └───────────────┬──────────────────────────┘
+                                 │  Packet (portable)
+                                 ▼
+                 ┌─────────────────────────────────────────┐
+                 │  ENGINE (the brain) — same for every      │
+                 │  backend:  conntrack → rules → verdict     │
+                 └─────────────────────────────────────────┘
+```
+
+The big idea: **the brain never changes, only the plumbing does.** Learn the
+logic in the safe simulator now; switch to real traffic later without a rewrite.
+
+## Run it
+
+```bash
+cd ngfw
+python3 -m ngfw --demo                 # built-in scenario (no deps, no root)
+python3 -m ngfw --rules rules.example.conf
+python3 -m unittest discover -s tests  # 6 tests
+```
+
+Each line of output shows: the **verdict**, the **connection state** conntrack
+assigned (`new` / `established` / `invalid`), the packet, and **which rule
+decided it** — so you can watch the firewall think.
+
+## What's here (and what each file teaches)
+
+| File | Concept |
+|------|---------|
+| `ngfw/packet.py` | A portable packet model — the common language every backend speaks. |
+| `ngfw/rules.py` | A human-readable policy file + matcher. First-match-wins, like real firewalls. |
+| `ngfw/conntrack.py` | **Connection tracking** — the difference between a dumb ACL and a *stateful* firewall. |
+| `ngfw/engine.py` | The decision loop: conntrack → rules → verdict, with **default-deny**. |
+| `ngfw/backends/base.py` | The backend interface (the swappable plumbing). |
+| `ngfw/backends/simulated.py` | A scripted, safe data plane to experiment in. |
+| `rules.example.conf` | A commented starter policy. Edit it and re-run. |
+| `tests/` | Behaviour locked in so you can refactor fearlessly. |
+
+## The one concept to take away first: **state**
+
+A stateless filter judges each packet alone. A **stateful** firewall remembers
+flows, so the reply traffic of a connection *you* started is allowed
+automatically — without leaving a permanent inbound hole for strangers. In the
+demo, watch the DNS reply and the TCP handshake replies come back in as
+`established` even though the only inbound "new" rule is for SSH.
+
+## Try this (learning exercises)
+
+1. In `rules.example.conf`, delete the `established` rule (#2) and re-run — watch
+   all your return traffic break. That's *why* conntrack exists.
+2. Change the SSH rule port from `22` to `443` and see inbound rules shift.
+3. Add a rule to allow inbound ICMP (ping) and craft a packet for it.
+4. Flip the default policy to `allow` in `__main__.py` and see why default-deny
+   is the safe industry norm.
+
+## Roadmap — how this grows into a NGFW
+
+Each stage adds a layer *on top of* the same engine. We'll do them one at a time.
+
+- [x] **Stage 1 — Stateful L3/L4 core** (this): 5-tuple rules, conntrack (TCP
+      state machine + UDP/ICMP), default-deny, logging, tests.
+- [ ] **Stage 2 — Real packets (pcap backend):** read a `.pcap` or live-sniff
+      with `scapy`, feed the *same* engine. Still no enforcement, but real data.
+- [ ] **Stage 3 — Inline enforcement (NFQUEUE backend):** on Linux, actually
+      drop/allow live packets via netfilter. First "real" firewall.
+- [ ] **Stage 4 — Layer 7 app-ID & DPI:** identify HTTP, TLS (SNI), DNS; match
+      rules on *application*, not just port.
+- [ ] **Stage 5 — IDS/IPS:** signature engine (Suricata-style rules) + simple
+      anomaly checks (port-scan, SYN-flood detection).
+- [ ] **Stage 6 — NGFW extras:** TLS/SNI policy, GeoIP, logging to JSON/syslog,
+      a config/reload story, and a Go port of the hot path for throughput.
+
+## Scope & ethics
+
+A firewall is a defensive tool. This project is for learning and for protecting
+systems you own or are authorized to defend.
