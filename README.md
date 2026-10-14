@@ -6,7 +6,7 @@ and the UDP transport itself can run over IPv4 or IPv6.
 
 ## How it works
 
-- **Identity:** every node has its own X25519 key pair. The server has a list of allowed client public keys, each pinned to its own tunnel addresses (one IPv4, one IPv6, or both). Each client is configured with the server's public key.
+- **Identity:** every node has its own X25519 key pair. The server has a list of allowed client public keys. Each key is pinned to its "allowed IPs": its tunnel addresses (one IPv4, one IPv6, or both) plus any subnets routed through it. Each client is configured with the server's public key.
 - **Handshake:** the handshake follows the [Noise](https://noiseprotocol.org/) `IK` pattern, the one WireGuard uses:
   - `INIT` carries the client's ephemeral key. It also carries the client's static key and a timestamp, both encrypted to the server's static key.
   - `RESPONSE` carries the server's ephemeral key and an authentication tag.
@@ -16,7 +16,7 @@ and the UDP transport itself can run over IPv4 or IPv6.
   A 2048-packet sliding window rejects replayed packets.
 - **Hardening:**
   - Replayed `INIT`s are rejected, using a ±60s clock-skew window plus a per-peer timestamp that only moves forward.
-  - The server drops packets whose inner source IP isn't one of the sender's assigned tunnel addresses, so a client can't pose as another client.
+  - The server drops packets whose inner source IP isn't within the sender's allowed IPs, so a client can't pose as another client or another site.
   - Clients rekey every 10 minutes and send a keepalive every 25s. Idle sessions expire after 3 minutes.
   - Clients can roam to a new address: the server follows the last authenticated source address.
 - **IPv6:**
@@ -24,6 +24,7 @@ and the UDP transport itself can run over IPv4 or IPv6.
   - On the transport side, the server listens on `[::]` by default, accepting both IPv6 and IPv4 (as v4-mapped addresses). It falls back to `0.0.0.0` on hosts without IPv6.
   - Clients resolve the server name and use whichever family it returns first. Pass `-4` or `-6` to force one.
   - The handshake carries no tunnel addresses, so the wire format is the same for both families.
+- **Routing:** the server keeps a longest-prefix-match table of all peers' allowed IPs (`vpn/routing.py`). It's used both to pick the peer for an outgoing packet and to check incoming sources. Allowed IPs may not overlap between peers, so every address belongs to exactly one peer.
 - **Handshake-flood (DoS) protection:** this follows WireGuard's cookie mechanism (`vpn/dos.py`).
   - **mac1:** every `INIT` carries a MAC keyed by the server's public key. Junk and packets aimed at the wrong server are dropped without any Diffie-Hellman work.
   - **Cookies:** when the server sees more than `--load-threshold` handshakes per second (default 50), it stops doing handshakes for `INIT`s without a valid mac2. Instead it sends a small encrypted `COOKIE` reply.
@@ -34,7 +35,7 @@ and the UDP transport itself can run over IPv4 or IPv6.
   - **Rate limit:** while under load, handshakes that do carry a valid cookie are also limited to 5/s per source IP, with bursts of up to 10.
 
 Code layout: `vpn/crypto.py` (primitives), `vpn/protocol.py` (wire format, sessions, replay window),
-`vpn/dos.py` (cookies, load detection, rate limiting), `vpn/node.py` (server/client state machines, socket-free), `vpn/tun.py`, `vpn/__main__.py` (CLI + event loop).
+`vpn/dos.py` (cookies, load detection, rate limiting), `vpn/routing.py` (longest-prefix match), `vpn/node.py` (server/client state machines, socket-free), `vpn/tun.py`, `vpn/__main__.py` (CLI + event loop).
 
 ## Usage
 
@@ -77,6 +78,33 @@ ip6tables -t nat -A POSTROUTING -s fd00:8::/64 -o eth0 -j MASQUERADE
 
 On the client, add a host route to the server via your normal gateway. Then route `0.0.0.0/1` and `128.0.0.0/1` through the TUN device. For IPv6, also route `::/1` and `8000::/1` through it.
 
+## Site-to-site
+
+A client can act as the gateway for a whole network behind it, and LANs behind the server can be reached through the tunnel.
+For example, to connect office A (`192.168.20.0/24`, behind client `gw-a`) with office B (`192.168.10.0/24`, behind the server):
+
+```sh
+# server (office B gateway): give the client its subnet as well as its tunnel address
+#   peers.txt:  <gw-a public key>   10.8.0.2,192.168.20.0/24
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo python3 -m vpn server --private-key-file node.key --address 10.8.0.1/24 --peers-file peers.txt
+#   -> adds "192.168.20.0/24 dev vpn0" automatically
+
+# client gw-a (office A gateway): route office B's subnet into the tunnel
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo python3 -m vpn client --private-key-file node.key --address 10.8.0.2/24 \
+    --route 192.168.10.0/24 --server vpn.example.com --server-public-key <server public key>
+```
+
+Hosts on each LAN need a route to the other LAN via their local VPN gateway. If the gateway is already their default router, nothing else is needed.
+No NAT is involved, so hosts see each other's real addresses.
+The rules for allowed IPs:
+- Inside the tunnel subnet, a peer may only hold single host addresses.
+- Outside it, a peer may hold any subnet, as long as it doesn't overlap the tunnel subnet or another peer's networks.
+- A plain address outside the tunnel subnet is a single routed host (`/32` or `/128`).
+
+IPv6 subnets work the same way, e.g. `2001:db8:20::/48` in the peers file and `--route 2001:db8:10::/48` on the client.
+
 ## Tests
 
 ```sh
@@ -87,8 +115,9 @@ The tests run the full client/server protocol through in-memory transports, so t
 
 ## Limitations (it's a learning project)
 
-- **One address per IP family per peer.** Peers get host addresses only, not routed subnets, so there's no site-to-site setup.
+- **Hub and spoke only.** Clients talk to the server, not directly to each other. Traffic between two client sites goes through the server, and their `--route`s must cover it.
   Peer config is static: changing it needs a server restart.
+- **No full-tunnel peer on the server side.** A peer can't hold `0.0.0.0/0`, because that would overlap the tunnel subnet. Use the client-side `0.0.0.0/1` + `128.0.0.0/1` routes described above instead.
 - **Single-threaded event loop.** The DoS defences cap the expensive work, but a large enough
   raw packet flood can still saturate the loop. Put a firewall in front of anything exposed.
 - **Python throughput.** Speed is limited by Python itself. Don't expect line-rate performance.

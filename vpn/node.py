@@ -14,6 +14,7 @@ from typing import Callable
 
 from . import crypto, dos, protocol
 from .protocol import ProtocolError
+from .routing import IPNetwork, RoutingTable
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +44,8 @@ REKEY_INTERVAL = 600.0
 @dataclass
 class _ServerPeer:
     public_key: bytes
-    addresses: frozenset[protocol.IPAddress]
+    # Tunnel addresses and routed subnets this peer may send from and receive for.
+    allowed: tuple[IPNetwork, ...]
     session: protocol.Session | None = None
     addr: Addr | None = None
     # Highest handshake timestamp accepted, kept after a session expires so a
@@ -52,12 +54,13 @@ class _ServerPeer:
 
     @property
     def name(self) -> str:
-        return ",".join(sorted(map(str, self.addresses), key=lambda a: (":" in a, a)))
+        return ",".join(n.with_prefixlen if n.num_addresses > 1 else str(n.network_address)
+                        for n in self.allowed)
 
 
 class Server:
     def __init__(self, static: crypto.KeyPair, interfaces: list[IPInterface],
-                 peers: dict[bytes, list[protocol.IPAddress]], send: SendFn, tun_write: TunWriteFn,
+                 peers: dict[bytes, list[IPNetwork]], send: SendFn, tun_write: TunWriteFn,
                  load_threshold: int = dos.DEFAULT_LOAD_THRESHOLD, clock: dos.Clock = time.monotonic) -> None:
         self.static = static
         self.clock = clock
@@ -68,19 +71,37 @@ class Server:
         self.send = send
         self.tun_write = tun_write
         self.peers: dict[bytes, _ServerPeer] = {}
-        self.by_ip: dict[protocol.IPAddress, _ServerPeer] = {}
-        for key, addresses in peers.items():
-            if not addresses:
+        # Used both to route outgoing packets and to check incoming sources: since
+        # allowed networks never overlap, a source is legitimate iff it routes back
+        # to the peer that sent it.
+        self.routes: RoutingTable[_ServerPeer] = RoutingTable()
+        claimed: list[IPNetwork] = []
+        for key, allowed in peers.items():
+            if not allowed:
                 raise ValueError(f"peer {crypto.encode_key(key)} has no addresses")
-            peer = self.peers[key] = _ServerPeer(key, frozenset(addresses))
-            for ip in addresses:
-                if not any(ip.version == i.version and ip in i.network and ip not in _reserved(i)
-                           for i in interfaces):
-                    raise ValueError(f"peer address {ip} is not usable in any tunnel subnet")
-                if ip in self.by_ip:
-                    raise ValueError(f"peer address {ip} assigned twice")
-                self.by_ip[ip] = peer
+            peer = self.peers[key] = _ServerPeer(key, tuple(allowed))
+            for net in allowed:
+                self._check_allowed(net, claimed)
+                claimed.append(net)
+                self.routes.insert(net, peer)
         self.by_index: dict[int, _ServerPeer] = {}
+
+    def _check_allowed(self, net: IPNetwork, claimed: list[IPNetwork]) -> None:
+        tunnel_nets = [i for i in self.interfaces if i.version == net.version]
+        if any(net.overlaps(i.network) for i in tunnel_nets):
+            # Inside a tunnel subnet a peer may only hold single, usable host addresses.
+            if net.num_addresses != 1 or not any(
+                    net.network_address in i.network and net.network_address not in _reserved(i)
+                    for i in tunnel_nets):
+                raise ValueError(f"peer address {net} is not a usable host address in the tunnel subnet")
+        for other in claimed:
+            if net.version == other.version and net.overlaps(other):
+                raise ValueError(f"peer networks {other} and {net} overlap")
+
+    def routed_networks(self) -> list[IPNetwork]:
+        """Peer subnets outside the tunnel subnets; the kernel needs routes for these via the TUN device."""
+        return [net for peer in self.peers.values() for net in peer.allowed
+                if not any(net.version == i.version and net.subnet_of(i.network) for i in self.interfaces)]
 
     def handle_datagram(self, data: bytes, addr: Addr) -> None:
         try:
@@ -126,13 +147,13 @@ class Server:
         peer.addr = addr  # authenticated packet: follow the peer if it roams
         if not payload:
             return  # keepalive
-        if protocol.ip_source(payload) not in peer.addresses:
-            raise ProtocolError(f"spoofed source from peer {peer.name}")
+        if self.routes.lookup(protocol.ip_source(payload)) is not peer:
+            raise ProtocolError(f"source not allowed for peer {peer.name}")
         self.tun_write(payload)
 
     def handle_tun(self, packet: bytes) -> None:
         dst = protocol.ip_destination(packet)
-        peer = self.by_ip.get(dst) if dst else None
+        peer = self.routes.lookup(dst)
         if peer is None or peer.session is None:
             return
         self.send(peer.session.seal(packet), peer.addr)

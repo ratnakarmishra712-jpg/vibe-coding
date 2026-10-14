@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from vpn import crypto, dos, protocol
+from vpn.routing import RoutingTable
 from vpn.__main__ import load_peers, parse_hostport, parse_interfaces, server_socket
 from vpn.node import SESSION_TIMEOUT, Client, Server
 
@@ -15,9 +16,10 @@ SERVER_KEY = crypto.KeyPair.generate()
 ALICE = crypto.KeyPair.generate()
 BOB = crypto.KeyPair.generate()
 MALLORY = crypto.KeyPair.generate()
-ALICE_IP = ipaddress.ip_address("10.8.0.2")
-ALICE_IP6 = ipaddress.ip_address("fd00:8::2")
-BOB_IP = ipaddress.ip_address("10.8.0.3")
+net = ipaddress.ip_network
+ALICE_IP = net("10.8.0.2/32")
+ALICE_IP6 = net("fd00:8::2/128")
+BOB_IP = net("10.8.0.3/32")
 SERVER_ADDR = ("192.0.2.1", 51820)
 PEERS = {ALICE.public: [ALICE_IP, ALICE_IP6], BOB.public: [BOB_IP]}
 SERVER_IFACES = [ipaddress.ip_interface("10.8.0.1/24"), ipaddress.ip_interface("fd00:8::1/64")]
@@ -415,12 +417,10 @@ class IPv6Test(unittest.TestCase):
             net.now += 1  # handshake timestamps must increase per peer
 
     def test_server_rejects_bad_ipv6_peer_config(self):
-        for addrs in (["fd00:9::2"], ["fd00:8::1"], ["fd00:8::"], []):
+        for addrs in (["fd00:8::1"], ["fd00:8::"], ["fd00:8::/120"], []):
             with self.assertRaises(ValueError):
-                Server(SERVER_KEY, SERVER_IFACES, {ALICE.public: [ipaddress.ip_address(a) for a in addrs]},
+                Server(SERVER_KEY, SERVER_IFACES, {ALICE.public: [net(a) for a in addrs]},
                        lambda d, a: None, lambda p: None)
-        with self.assertRaises(ValueError):  # IPv6 peer on an IPv4-only server
-            Server(SERVER_KEY, SERVER_IFACES[:1], {ALICE.public: [ALICE_IP6]}, lambda d, a: None, lambda p: None)
 
     def test_dual_stack_socket_accepts_ipv4(self):
         try:
@@ -434,6 +434,63 @@ class IPv6Test(unittest.TestCase):
             sender.sendto(b"x", ("127.0.0.1", sock.getsockname()[1]))
             data, addr = sock.recvfrom(16)
             self.assertEqual((data, addr[0]), (b"x", "::ffff:127.0.0.1"))
+
+
+class RoutingTableTest(unittest.TestCase):
+    def test_longest_prefix_match(self):
+        rt = RoutingTable()
+        rt.insert(net("0.0.0.0/0"), "default")
+        rt.insert(net("10.0.0.0/8"), "ten")
+        rt.insert(net("10.1.0.0/16"), "ten-one")
+        rt.insert(net("10.1.2.3/32"), "host")
+        rt.insert(net("2001:db8::/32"), "v6")
+        ip = ipaddress.ip_address
+        self.assertEqual(rt.lookup(ip("10.1.2.3")), "host")
+        self.assertEqual(rt.lookup(ip("10.1.2.4")), "ten-one")
+        self.assertEqual(rt.lookup(ip("10.2.0.1")), "ten")
+        self.assertEqual(rt.lookup(ip("192.0.2.1")), "default")
+        self.assertEqual(rt.lookup(ip("2001:db8::1")), "v6")
+        self.assertIsNone(rt.lookup(ip("2001:db9::1")))
+        self.assertIsNone(rt.lookup(None))
+
+
+class SiteToSiteTest(unittest.TestCase):
+    """Alice is a gateway for 192.168.20.0/24 and 2001:db8:20::/48 behind her."""
+
+    ALICE_ADDR = ("198.51.100.7", 40000)
+    ALICE_LAN = [net("192.168.20.0/24"), net("2001:db8:20::/48")]
+
+    def setUp(self):
+        peers = {ALICE.public: [ALICE_IP, *self.ALICE_LAN], BOB.public: [BOB_IP, net("192.168.30.0/24")]}
+        self.net = Network()
+        self.net.server = Server(SERVER_KEY, SERVER_IFACES, peers,
+                                 lambda d, a: self.net.wire.append((d, SERVER_ADDR, a)), self.net.server_tun.append,
+                                 clock=lambda: self.net.now)
+        self.alice = self.net.add_client(ALICE, self.ALICE_ADDR)
+        self.net.connect(self.alice)
+
+    def test_server_routes_lan_traffic_to_gateway(self):
+        packets = [ipv4_packet("192.168.10.5", "192.168.20.9"), ipv6_packet("2001:db8:10::5", "2001:db8:20:1::9")]
+        for p in packets:
+            self.net.server.handle_tun(p)
+        self.net.deliver()
+        self.assertEqual(self.net.client_tun[self.ALICE_ADDR], packets)
+
+    def test_gateway_forwards_lan_hosts_traffic(self):
+        p = ipv4_packet("192.168.20.9", "192.168.10.5")
+        self.alice.handle_tun(p)
+        self.net.deliver()
+        self.assertEqual(self.net.server_tun, [p])
+
+    def test_gateway_cannot_claim_other_sites(self):
+        for src in ("192.168.30.9", "192.168.21.9", "10.8.0.3"):
+            self.alice.handle_tun(ipv4_packet(src, "192.168.10.5"))
+        self.net.deliver()
+        self.assertEqual(self.net.server_tun, [])
+
+    def test_routed_networks_excludes_tunnel_hosts(self):
+        self.assertEqual(sorted(map(str, self.net.server.routed_networks())),
+                         ["192.168.20.0/24", "192.168.30.0/24", "2001:db8:20::/48"])
 
 
 class ConfigTest(unittest.TestCase):
@@ -465,17 +522,22 @@ class ConfigTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
             f.write(f"# comment\n{crypto.encode_key(ALICE.public)} 10.8.0.2,fd00:8::2\n\n")
         try:
-            peers = load_peers(f.name, [f"{crypto.encode_key(BOB.public)}=10.8.0.3"])
+            peers = load_peers(f.name, [f"{crypto.encode_key(BOB.public)}=10.8.0.3,192.168.30.0/24"])
         finally:
             os.unlink(f.name)
-        self.assertEqual(peers, PEERS)
+        self.assertEqual(peers, {**PEERS, BOB.public: [BOB_IP, net("192.168.30.0/24")]})
+        with self.assertRaises(ValueError):  # host bits set
+            load_peers(None, [f"{crypto.encode_key(BOB.public)}=192.168.30.1/24"])
 
     def test_server_rejects_bad_peer_config(self):
-        ip = ipaddress.ip_address
-        for peers in ({ALICE.public: [ip("10.9.0.2")]},
-                      {ALICE.public: [ip("10.8.0.1")]},
-                      {ALICE.public: [ip("10.8.0.255")]},
-                      {ALICE.public: [ALICE_IP], BOB.public: [ALICE_IP]}):
+        for peers in ({ALICE.public: [net("10.8.0.1/32")]},          # the server's own address
+                      {ALICE.public: [net("10.8.0.255/32")]},        # broadcast
+                      {ALICE.public: [net("10.8.0.0/28")]},          # subnet inside the tunnel subnet
+                      {ALICE.public: [net("10.0.0.0/8")]},           # subnet covering the tunnel subnet
+                      {ALICE.public: [ALICE_IP], BOB.public: [ALICE_IP]},
+                      {ALICE.public: [ALICE_IP, net("192.168.0.0/16")],
+                       BOB.public: [BOB_IP, net("192.168.20.0/24")]},  # overlapping routed subnets
+                      {ALICE.public: []}):
             with self.assertRaises(ValueError):
                 Server(SERVER_KEY, SERVER_IFACES, peers, lambda d, a: None, lambda p: None)
 

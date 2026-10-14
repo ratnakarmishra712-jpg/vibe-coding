@@ -39,6 +39,11 @@ class Tun:
             _ip("addr", "add", str(address), "dev", self.name, *extra)
         _ip("link", "set", "dev", self.name, "up")
 
+    def add_routes(self, networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> None:
+        """Route `networks` into the tunnel. Requires CAP_NET_ADMIN."""
+        for net in networks:
+            _ip("route", "add", str(net), "dev", self.name)
+
     def fileno(self) -> int:
         return self.fd
 

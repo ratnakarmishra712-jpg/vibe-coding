@@ -85,7 +85,11 @@ def _run(node, sock: socket.socket, tun: Tun) -> None:
 
 
 def load_peers(path: str | None, inline: list[str]) -> dict[bytes, list]:
-    """Read `<public-key> <ip>[,<ip>...]` lines (from a file and/or --peer KEY=IP[,IP] flags)."""
+    """Read `<public-key> <allowed>[,<allowed>...]` lines (from a file and/or --peer flags).
+
+    Each allowed entry is a tunnel address (`10.8.0.2`, `fd00:8::2`) or a subnet
+    routed through that peer (`192.168.20.0/24`).
+    """
     entries: list[tuple[str, str]] = []
     if path:
         with open(path, encoding="ascii") as f:
@@ -95,19 +99,20 @@ def load_peers(path: str | None, inline: list[str]) -> dict[bytes, list]:
                     continue
                 parts = line.split()
                 if len(parts) != 2:
-                    raise ValueError(f"{path}:{lineno}: expected '<public-key> <ip>[,<ip>...]'")
+                    raise ValueError(f"{path}:{lineno}: expected '<public-key> <ip-or-subnet>[,...]'")
                 entries.append((parts[0], parts[1]))
     for item in inline:
         key, sep, ip = item.rpartition("=")
         if not sep:
-            raise ValueError(f"--peer expects KEY=IP[,IP], got {item!r}")
+            raise ValueError(f"--peer expects KEY=IP[,IP-OR-SUBNET...], got {item!r}")
         entries.append((key, ip))
     peers: dict[bytes, list] = {}
     for key_text, ips_text in entries:
         key = crypto.decode_key(key_text)
         if key in peers:
             raise ValueError(f"duplicate peer key {key_text}")
-        peers[key] = [ipaddress.ip_address(ip) for ip in ips_text.split(",") if ip]
+        # strict: reject "192.168.20.1/24" (host bits set) rather than silently widening it
+        peers[key] = [ipaddress.ip_network(item, strict=True) for item in ips_text.split(",") if item]
     return peers
 
 
@@ -131,6 +136,10 @@ def cmd_server(args: argparse.Namespace) -> None:
     server = Server(static, ifaces, peers, lambda d, a: sock.sendto(d, a), tun.write,
                     load_threshold=args.load_threshold)
     tun.configure(ifaces, args.mtu)
+    routed = server.routed_networks()
+    tun.add_routes(routed)
+    if routed:
+        logging.info("routing peer subnets: %s", ", ".join(map(str, routed)))
     logging.info("listening on %s, tunnel %s on %s, %d peer(s), public key %s",
                  format_addr(sock.getsockname()), ", ".join(map(str, ifaces)), tun.name, len(peers),
                  crypto.encode_key(static.public))
@@ -145,6 +154,7 @@ def cmd_client(args: argparse.Namespace) -> None:
     sock, server_addr = client_socket(host, port, args.family)
     tun = Tun(args.dev)
     tun.configure(ifaces, args.mtu)
+    tun.add_routes(args.route)
     client = Client(static, server_public, server_addr, lambda d, a: sock.sendto(d, a), tun.write)
     logging.info("connecting to %s as %s on %s, public key %s", format_addr(server_addr),
                  ", ".join(map(str, ifaces)), tun.name, crypto.encode_key(static.public))
@@ -176,15 +186,20 @@ def main(argv: list[str] | None = None) -> None:
         sp.add_argument("--mtu", type=int, default=DEFAULT_MTU)
         if name == "server":
             sp.add_argument(endpoint_flag, help=endpoint_help)
-            sp.add_argument("--peers-file", help="file of '<public-key> <ip>[,<ip>...]' lines")
-            sp.add_argument("--peer", action="append", default=[], metavar="KEY=IP[,IP]",
-                            help="allow a client public key with the given tunnel IPs (repeatable)")
+            sp.add_argument("--peers-file",
+                            help="file of '<public-key> <ip-or-subnet>[,<ip-or-subnet>...]' lines")
+            sp.add_argument("--peer", action="append", default=[], metavar="KEY=IP[,IP-OR-SUBNET...]",
+                            help="allow a client public key with the given tunnel addresses and "
+                                 "routed subnets (repeatable)")
             sp.add_argument("--load-threshold", type=int, default=dos.DEFAULT_LOAD_THRESHOLD, metavar="N",
                             help="handshakes per second before requiring cookies "
                                  f"(default {dos.DEFAULT_LOAD_THRESHOLD})")
         else:
             sp.add_argument(endpoint_flag, required=True, help=endpoint_help)
             sp.add_argument("--server-public-key", required=True, help="the server's public key")
+            sp.add_argument("--route", action="append", default=[], type=ipaddress.ip_network,
+                            metavar="SUBNET", help="send traffic for SUBNET through the tunnel, e.g. a "
+                                                   "LAN behind the server (repeatable)")
             fam = sp.add_mutually_exclusive_group()
             fam.add_argument("-4", dest="family", action="store_const", const=socket.AF_INET,
                              help="reach the server over IPv4 only")
